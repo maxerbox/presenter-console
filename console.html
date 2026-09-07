@@ -250,7 +250,11 @@
       // percentages of #main, persisted to localStorage; double-click a
       // separator to reset, drag to resize.
       const DEFAULT_SIZES = [58, 24, 18];
-      const split = Split(["noteswrap", "slidewrap", "nextwrap"], {
+      // Split.js takes CSS SELECTORS (or elements) — bare "noteswrap"
+      // would look for a <noteswrap> tag and throw.
+      const split = Split(
+        ["#noteswrap", "#slidewrap", "#nextwrap"],
+        {
         sizes: loadSizes(),
         minSize: [120, 100, 100],
         gutterSize: 5,
