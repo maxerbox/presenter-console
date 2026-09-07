@@ -3,7 +3,7 @@
 A two-window presenter console for LaTeX **beamer** decks with speaker
 notes — running entirely in your browser, no server required.
 
-[**▶ Live demo (GitHub Pages)**](https://maxerbox.github.io/presenter-console/)
+[**▶ Live demo**](https://maxerbox.github.io/presenter-console/console.html)
 
 Pick **one** PDF — the double-width build from beamer's
 `show notes on second screen=right` — and you get:
@@ -24,7 +24,7 @@ anywhere.
 
 ### Online
 
-Open the **[live demo](https://maxerbox.github.io/presenter-console/)**,
+Open the **[live demo](https://maxerbox.github.io/presenter-console/console.html)**,
 click **Try sample deck**, then **Open audience window** (allow the
 popup), and turn pages with the arrow keys from either window. The
 sample deck includes an `animate`-package animation to prove animations
