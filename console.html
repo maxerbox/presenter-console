@@ -7,7 +7,9 @@
          (slide | notes, from ..._presentation_notes.tex).  Layout (all
          separators draggable, double-click to reset, sizes saved to
          localStorage):
-           [ notes | current slide | next slide ]
+           [ notes | ( current slide / next slide ) ]
+         — notes on the left; on the right the current slide stacked
+         above the next slide, split by a draggable separator.
          The audience window runs the OFFICIAL pdf.js viewer and receives
          a cropped slide-only copy of the same PDF (CropBox surgery keeps
          document JS and widgets, so animate-package animations play).
@@ -104,18 +106,26 @@
       #noteswrap {
         background: #262626;
       }
+      #rightcol {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        min-height: 0;
+      }
       #slidewrap,
       #nextwrap {
         background: #1a1a1a;
       }
-      /* Split.js gutters between the three panes */
-      .gutter {
+      /* Split.js gutters — .gutter-h is the vertical bar between notes
+         and the right column, .gutter-v the horizontal bar between the
+         current and next slide panes */
+      .gutter-h {
         flex: 0 0 5px;
         background: #333;
         cursor: col-resize;
         position: relative;
       }
-      .gutter::after {
+      .gutter-h::after {
         content: "";
         position: absolute;
         top: 50%;
@@ -125,16 +135,42 @@
         transform: translate(-50%, -50%);
         background: #666;
       }
-      .gutter:hover,
-      .gutter.dragging {
+      .gutter-v {
+        flex: 0 0 5px;
+        background: #333;
+        cursor: row-resize;
+        position: relative;
+      }
+      .gutter-v::after {
+        content: "";
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 34px;
+        height: 1px;
+        transform: translate(-50%, -50%);
+        background: #666;
+      }
+      .gutter-h:hover,
+      .gutter-h.dragging,
+      .gutter-v:hover,
+      .gutter-v.dragging {
         background: #4a6a9a;
       }
-      .gutter.dragging {
+      .gutter-h.dragging {
         cursor: col-resize;
       }
-      body.splitting,
-      body.splitting * {
+      .gutter-v.dragging {
+        cursor: row-resize;
+      }
+      body.splitting-h,
+      body.splitting-h * {
         cursor: col-resize !important;
+        user-select: none !important;
+      }
+      body.splitting-v,
+      body.splitting-v * {
+        cursor: row-resize !important;
         user-select: none !important;
       }
       #overlay {
@@ -213,8 +249,10 @@
     </div>
     <div id="main">
       <div id="noteswrap" class="pane"></div>
-      <div id="slidewrap" class="pane"></div>
-      <div id="nextwrap" class="pane"></div>
+      <div id="rightcol">
+        <div id="slidewrap" class="pane"></div>
+        <div id="nextwrap" class="pane"></div>
+      </div>
     </div>
     <div id="overlay">
       <div class="card">
@@ -222,11 +260,11 @@
         <p>
           Pick your <b>presentation PDF</b> — the double-width
           slide&nbsp;|&nbsp;notes build (from
-          <code>..._presentation_notes.tex</code>). The console shows the
-          notes, a current-slide preview and a next-slide preview (drag
-          the separators to resize; double-click a separator to reset);
-          the audience window receives a cropped slide-only copy —
-          animations included.
+          <code>..._presentation_notes.tex</code>). The console shows the notes
+          on the left, the current slide above the next slide on the right
+          (drag the separators to resize; double-click a separator to reset);
+          the audience window receives a cropped slide-only copy — animations
+          included.
         </p>
         <button id="pickPdf">Browse PDF…</button>
         <button id="loadSample" title="Fetch the bundled sample deck">
@@ -245,52 +283,77 @@
 
       const $ = (id) => document.getElementById(id);
 
-      // ---- three resizable panes (Split.js) -------------------------------------
-      // Layout: [ notes | current slide | next slide ].  Pane sizes are
-      // percentages of #main, persisted to localStorage; double-click a
-      // separator to reset, drag to resize.
-      const DEFAULT_SIZES = [58, 24, 18];
+      // ---- resizable regions (Split.js) ---------------------------------------
+      // Layout: [ notes | ( current slide / next slide ) ] — notes on the
+      // left; on the right the current slide stacked above the next slide.
+      // Two nested Split instances: the outer one horizontal (notes vs
+      // right column), the inner one vertical (current vs next).  Sizes
+      // are percentages, persisted to localStorage (separate keys);
+      // double-click a separator to reset, drag to resize.
       // Split.js takes CSS SELECTORS (or elements) — bare "noteswrap"
       // would look for a <noteswrap> tag and throw.
-      const split = Split(
-        ["#noteswrap", "#slidewrap", "#nextwrap"],
-        {
-        sizes: loadSizes(),
-        minSize: [120, 100, 100],
+      const DEFAULT_MAIN_SIZES = [58, 42];
+      const DEFAULT_STACK_SIZES = [62, 38];
+      const resetSizes = () => {
+        splitMain.setSizes(DEFAULT_MAIN_SIZES);
+        splitStack.setSizes(DEFAULT_STACK_SIZES);
+        saveSizes("paneSizes", DEFAULT_MAIN_SIZES);
+        saveSizes("stackSizes", DEFAULT_STACK_SIZES);
+        rerender();
+      };
+      const makeGutter = (cls) => (index, direction) => {
+        const g = document.createElement("div");
+        g.className = cls;
+        g.title = "drag to resize, double-click to reset";
+        g.addEventListener("dblclick", resetSizes);
+        return g;
+      };
+      const splitMain = Split(["#noteswrap", "#rightcol"], {
+        sizes: loadSizes("paneSizes", DEFAULT_MAIN_SIZES),
+        minSize: [120, 100],
         gutterSize: 5,
-        gutter: (index, direction) => {
-          const g = document.createElement("div");
-          g.className = "gutter";
-          g.title = "drag to resize, double-click to reset";
-          g.addEventListener("dblclick", () => {
-            split.setSizes(DEFAULT_SIZES);
-            saveSizes(DEFAULT_SIZES);
-            rerender();
-          });
-          return g;
-        },
+        gutter: makeGutter("gutter gutter-h"),
         onDragStart() {
-          document.body.classList.add("splitting");
+          document.body.classList.add("splitting-h");
         },
         onDragEnd() {
-          document.body.classList.remove("splitting");
-          saveSizes(split.getSizes());
+          document.body.classList.remove("splitting-h");
+          saveSizes("paneSizes", splitMain.getSizes());
+          rerender();
+        },
+      });
+      const splitStack = Split(["#slidewrap", "#nextwrap"], {
+        direction: "vertical",
+        sizes: loadSizes("stackSizes", DEFAULT_STACK_SIZES),
+        minSize: [100, 100],
+        gutterSize: 5,
+        gutter: makeGutter("gutter gutter-v"),
+        onDragStart() {
+          document.body.classList.add("splitting-v");
+        },
+        onDragEnd() {
+          document.body.classList.remove("splitting-v");
+          saveSizes("stackSizes", splitStack.getSizes());
           rerender();
         },
       });
 
-      function loadSizes() {
+      function loadSizes(key, defaults) {
         try {
-          const s = JSON.parse(localStorage.getItem("paneSizes"));
-          if (Array.isArray(s) && s.length === 3 && s.every((x) => x > 0)) {
+          const s = JSON.parse(localStorage.getItem(key));
+          if (
+            Array.isArray(s) &&
+            s.length === defaults.length &&
+            s.every((x) => x > 0)
+          ) {
             return s;
           }
         } catch {}
-        return DEFAULT_SIZES;
+        return defaults;
       }
-      function saveSizes(s) {
+      function saveSizes(key, s) {
         try {
-          localStorage.setItem("paneSizes", JSON.stringify(s));
+          localStorage.setItem(key, JSON.stringify(s));
         } catch {}
       }
 

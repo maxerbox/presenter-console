@@ -1,116 +1,95 @@
-# presenter-console
+# Presenter console (one PDF, notes + audience animations)
 
-A two-window presenter console for LaTeX **beamer** decks with speaker notes —
-running entirely in your browser, no server required.
+> Published as
+> [maxerbox/presenter-console](https://github.com/maxerbox/presenter-console) —
+> live demo: <https://maxerbox.github.io/presenter-console/> (the published copy
+> is `Documents/presenter-console/`, refreshed from this folder by re-copying
+> the app files).
 
-[**▶ Live demo**](https://maxerbox.github.io/presenter-console/console.html)
+Pick **one** PDF — the double-width presentation build (`slide | notes`) — and
+get a two-window presenter setup:
 
-Pick **one** PDF — the double-width build from beamer's
-`show notes on second screen=right` — and you get:
-
-- a **presenter console**: speaker notes, a current-slide preview and a
-  next-slide preview in three resizable panes (drag the separators;
-  double-click to reset), with an elapsed-time timer,
-- an **audience window** running the stock official
-  [pdf.js](https://github.com/mozilla/pdf.js) viewer, which receives a **cropped
-  slide-only copy** of the same PDF, derived in-browser with
-  [pdf-lib](https://github.com/Hopding/pdf-lib) — so **PDF-JavaScript animations
-  still play** (`animate` package et al.).
-
-Both windows stay in sync (page turns in either one drive the other), and
-everything stays on your machine — the picked PDF is never uploaded anywhere.
-
-## Try it
-
-### Online
-
-Open the
-**[live demo](https://maxerbox.github.io/presenter-console/console.html)**,
-click **Try sample deck**, then **Open audience window** (allow the popup), and
-turn pages with the arrow keys from either window. The sample deck includes an
-`animate`-package animation of a **pgfplots** chart (training curves
-progressively drawn) to prove animations survive the crop.
-
-### Locally
-
-```
-python serve.py            # or: python -m http.server 8765
-```
-
-then open <http://localhost:8765/console.html>. Serving over http:// is required
-— ES modules and the pdf.js worker will not load from file://. Pick your own
-double-width deck, or try the bundled sample.
-
-> [!NOTE] The demo PDF in the popup works on GitHub Pages too: the viewer and
-> the console are served from the same origin, so `postMessage` sync works — no
-> `?file=` query needed.
-
-## Build your deck
-
-Any beamer deck with `\setbeameroption{show notes on second screen=right}`
-produces the expected double-width PDF. For example:
-
-```latex
-\documentclass[aspectratio=169]{beamer}
-\setbeameroption{show notes on second screen=right}
-\begin{document}
-\begin{frame}{Title}
-  Slide content
-  \note{Speaker notes — only the presenter sees these}
-\end{frame}
-\end{document}
-```
-
-See [`sample.tex`](sample.tex) for a deck that also includes an
-`animate`-package animation of a pgfplots chart, and a bare note-page template
-(no beamer chrome, small font) so long notes fit the half-page.
-
-## How it works
-
-- The console renders both halves of the double-width pages with pdf.js
-  (`screen.js`). Each repaint renders into a **fresh offscreen canvas** swapped
-  in only after completion — this structurally avoids pdf.js' "cannot use the
-  same canvas during multiple render() operations" error and the
-  flipped/double-composited output it leaves behind.
-- The audience deck is the **same document** re-saved with each double-width
-  page's **CropBox set to its left half** (pdf-lib). CropBox surgery only
-  touches page geometry — annotations (animate widgets), document JavaScript
-  (`/Names`, `/OpenAction`), outlines and links all pass through untouched, so
-  animations play in the official viewer.
-- `viewer-shim.js`, tagged into `web/viewer.html`, polls `PDFViewerApplication`,
-  subscribes to `pagechanging` on its event bus and `postMessage`s the page to
-  the console; the console sends `goto` and the cropped deck bytes
-  (`{type:"load", data}` → `PDFViewerApplication.open({data, filename})`).
-- Page numbers are identical console ↔ audience (same underlying document), so
-  sync is plain page numbers — no text mapping needed.
+- **Audience window** runs the stock **official pdf.js viewer**
+  (`web/viewer.html`) — full PDF-JavaScript support, so `animate`-package
+  animations play. It receives a **cropped slide-only copy** of your PDF,
+  derived in-browser via pdf-lib CropBox surgery (page objects, `/Annots`
+  widgets, document JS and links all survive — verified).
+- **Presenter console** shows the **notes (right half)** of every page on the
+  left, and on the right the **current slide stacked above the next slide**,
+  in **two resizable regions** (drag the separators — one vertical between
+  notes and slides, one horizontal between current and next slide; double-
+  click to reset), with an elapsed-time timer.
 
 ## Layout
 
 ```
-console.html        presenter console (single file picker) — static
-viewer-shim.js      sync bridge injected into web/viewer.html
-screen.js           pdf.js half-rendering core (flip-safe, HiDPI)
-split.min.js        Split.js 1.6.5 (resizable three-pane layout, MIT)
-pdf-lib.esm.min.js  pdf-lib 1.17.1 (in-browser CropBox cropping)
-sample.tex/.pdf     sample double-width deck (pgfplots + animate)
-serve.py            tiny static server for local use
-build/              pdf.js 6.3.289 core (pdf.mjs + worker + sandbox)
-web/                official pdf.js viewer (viewer.html / viewer.mjs …)
+presenter/
+├── console.html        presenter console (single file picker) — static
+├── viewer-shim.js      sync bridge injected into web/viewer.html
+├── screen.js           shared pdf.js half-rendering core (flip-safe)
+├── split.min.js        Split.js 1.6.5 (resizable two-region layout)
+├── pdf-lib.esm.min.js  pdf-lib 1.17.1 (in-browser CropBox cropping)
+├── sample.tex/.pdf     sample double-width deck (pgfplots + animate)
+├── sample_talk.pdf     bundled copy of the internship-talk notes build
+├── serve.py            static server (localhost:8765)
+├── build/              pdf.js 6.3.289 core (pdf.mjs + worker + sandbox)
+└── web/                official viewer.html / viewer.mjs + wasm assets
 ```
 
-## Credits
+## Usage
 
-- The halves pattern and the fresh-canvas rendering trick are from Euxane
-  Tran-Girard's [Beamer Viewer](https://src.euxane.eu/beamer-viewer/)
-  (EUPL-1.2).
-- Audience rendering by Mozilla's [pdf.js](https://github.com/mozilla/pdf.js)
-  viewer (Apache-2.0), pdf.js 6.3.289 official dist.
-- Deck cropping by Hopding's [pdf-lib](https://github.com/Hopding/pdf-lib)
-  (MIT).
-- Resizable panes by Nathan Cahill's [Split.js](https://split.js.org/) (MIT).
+1. Build the double-width PDF with `show notes on second screen=right` (only
+   this one — the audience deck is derived from it automatically; the regular
+   single-width build is not needed). A ready-made copy of the internship-talk
+   build is bundled as `sample_talk.pdf`.
 
-## License
+2. Serve (from `presenter/`): `python serve.py`
 
-Apache-2.0 — see [LICENSE](LICENSE). The vendored pdf.js viewer and its assets
-remain under their original licenses (Apache-2.0 and, for some wasm assets,
-their own terms — see `web/wasm/LICENSE_*`).
+3. Open `http://localhost:8765/console.html`, click **Browse PDF…** (or drag &
+   drop the file onto the page) and pick `sample_talk.pdf`. Or click **Try
+   sample deck** to load the bundled 3-page demo.
+
+4. Click **Open audience window** (allow the popup), drag it to the projector,
+   press `f` for fullscreen.
+
+5. Drive with keyboard (Space / arrows / PageUp / PageDown) from either window,
+   or the console buttons. Both stay in sync; the timer starts on the first page
+   turn (reset to 00:00 with the ↻ button next to it, or by clicking the timer —
+it restarts on your next page turn). Drag the separators to resize: the
+vertical one splits notes from the slide column, the horizontal one splits
+current from next slide; double-click a separator to reset; sizes are
+remembered across sessions.
+## How it works
+
+- `..._presentation_notes.tex` sets `show notes on second screen=right` →
+  double-width pages (slide | notes). This is the ONLY PDF involved.
+- The console renders both halves with `screen.js` `renderHalf()` — each repaint
+  renders into a **fresh offscreen canvas** swapped in only after completion, so
+  pdf.js' "same canvas during multiple render() operations" error (and
+  flipped/double-composited output) cannot happen. HiDPI-aware
+  (`devicePixelRatio`).
+- `makeAudienceDeck()` re-saves the same document with pdf-lib, each
+  double-width page's CropBox set to its left half. CropBox surgery only touches
+  page geometry — annotations (animate widgets), document JS (`/Names`,
+  `/OpenAction`), outlines and links pass through untouched, so animations play
+  in the official viewer.
+- `viewer-shim.js` (tagged into `web/viewer.html` as
+  `<script src="../viewer-shim.js" defer>`) polls `PDFViewerApplication`,
+  subscribes `pagechanging` on its eventBus and `postMessage`s the page to the
+  console; the console sends `goto` and the cropped deck bytes
+  (`{type:"load", data}` → `PDFViewerApplication.open({data, filename})`).
+- Page numbers are identical console↔audience (same underlying document), so
+  sync is plain page numbers — no text mapping needed.
+- Re-picking a PDF while the audience window is open pushes the new cropped deck
+  to it automatically.
+
+## Gotchas
+
+- The shim tag path is `../viewer-shim.js` (viewer lives in `web/`) —
+  `./viewer-shim.js` 404s and silently kills sync.
+- ES modules + WASM need http:// (serve.py), not file://
+- Slides without a `\note{}` show an empty right half in the console — content,
+  not a bug.
+- Note-overflow continuation pages: beamer repeats the slide half and carries
+  the note text over; the audience sees them cropped like any other page (the
+  slide repeats) — acceptable for presentation flow.
