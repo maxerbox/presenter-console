@@ -1,0 +1,51 @@
+% Sample deck for the presenter console.
+% Double-width pages (slide | notes) + an inline animate animation, so
+% the full pipeline (halves rendering, CropBox-derived audience deck,
+% animations in the official pdf.js viewer) can be demonstrated without
+% any external files.  Build: pdflatex sample.tex
+\documentclass[aspectratio=169]{beamer}
+\usepackage{animate}
+\usepackage{tikz}
+
+\setbeameroption{show notes on second screen=right}
+% Bare note pages: no beamer chrome, small font (same layout idea as the
+% real deck this console was built for).
+\setbeamertemplate{note page}{%
+  \vfill\footnotesize\raggedright\insertnote\par\vfill}
+
+\begin{document}
+
+\begin{frame}{Presenter console --- sample deck}
+  This PDF is \emph{double-width}: the slide occupies the left half of
+  every page, the speaker notes the right half.
+  \note{Welcome! This is the notes half --- only you see it. The
+    audience window receives a cropped slide-only copy of this same
+    PDF. Turn pages with the arrow keys or the buttons; the timer
+    starts on your first page turn (reset it with the button next to
+    it).}
+\end{frame}
+
+\begin{frame}{Animations survive the crop}
+  \begin{center}
+    \begin{animateinline}[autoplay,loop]{10}
+      \multiframe{10}{i=0+1}{%
+        \begin{tikzpicture}[scale=0.9]
+          \draw[very thin,color=gray] (0,0) grid (4,3);
+          \fill[orange] ({4*\i/9},{3*sin(\i*40)}) circle (0.18);
+        \end{tikzpicture}}
+    \end{animateinline}
+  \end{center}
+  \note{The orange dot is a PDF-JavaScript animation (animate package).
+    The audience deck is derived with pdf-lib CropBox surgery, which
+    keeps the widget annotations --- so the animation still plays in
+    the audience window (official pdf.js viewer).}
+\end{frame}
+
+\begin{frame}{Pick your own deck}
+  Use \textbf{Browse PDF\dots} to open your own double-width build ---
+  for example beamer's \texttt{show notes on second screen=right}.
+  \note{Slides without a \texttt{\textbackslash note\{\}} show an empty
+    right half in the console --- that is content, not a bug.}
+\end{frame}
+
+\end{document}

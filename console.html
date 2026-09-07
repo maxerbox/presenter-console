@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Presenter console</title>
+    <!-- Static page: pick ONE PDF — the double-width presentation build
+         (slide | notes, from ..._presentation_notes.tex).  The console
+         shows the notes (right half) + slide preview (left half); the
+         audience window runs the OFFICIAL pdf.js viewer and receives a
+         cropped slide-only copy of the same PDF (CropBox surgery keeps
+         document JS and widgets, so animate-package animations play).
+         Everything stays on your machine.  Serve over http:// (python
+         presenter/serve.py) so ES modules and the pdf.js worker can
+         load; file:// will NOT work. -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #1e1e1e;
+        color: #eee;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      #topbar {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+        padding: 6px 12px;
+        background: #111;
+        flex: 0 0 auto;
+        font-size: 13px;
+      }
+      #topbar button {
+        background: #333;
+        color: #eee;
+        border: 1px solid #555;
+        border-radius: 4px;
+        padding: 4px 10px;
+        cursor: pointer;
+        font-size: 13px;
+      }
+      #topbar button:hover {
+        background: #444;
+      }
+      #pageinfo {
+        min-width: 90px;
+        text-align: center;
+        font-variant-numeric: tabular-nums;
+      }
+      #timer {
+        min-width: 70px;
+        text-align: center;
+        font-variant-numeric: tabular-nums;
+        cursor: pointer;
+        user-select: none;
+      }
+      #status {
+        margin-left: auto;
+        color: #9ab;
+      }
+      #filebar {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+        padding: 5px 12px;
+        background: #151515;
+        border-bottom: 1px solid #333;
+        font-size: 13px;
+        flex: 0 0 auto;
+      }
+      #filebar label {
+        color: #9ab;
+      }
+      #filebar input[type="file"] {
+        color: #ccc;
+        font-size: 12px;
+        max-width: 420px;
+      }
+      #main {
+        flex: 1 1 auto;
+        display: flex;
+        min-height: 0;
+      }
+      #noteswrap {
+        flex: 1 1 62%;
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 8px;
+        background: #262626;
+      }
+      #noteswrap canvas,
+      #slidewrap canvas {
+        display: block;
+      }
+      #slidewrap {
+        flex: 0 0 30%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 8px;
+        background: #1a1a1a;
+        border-left: 1px solid #333;
+      }
+      #overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(20, 20, 20, 0.92);
+        z-index: 10;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      #overlay .card {
+        max-width: 640px;
+        padding: 32px 40px;
+        text-align: center;
+        border: 1px solid #344;
+        border-radius: 10px;
+        background: #232323;
+      }
+      #overlay h1 {
+        margin-top: 0;
+        font-size: 20px;
+      }
+      #overlay p {
+        color: #9ab;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      #overlay button {
+        margin: 6px;
+        padding: 10px 22px;
+        font-size: 14px;
+        background: #2d5f2d;
+        color: #eee;
+        border: 1px solid #4c8c4c;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      #overlay button:hover {
+        background: #387538;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="topbar">
+      <button id="prev" title="Previous slide (Left/PageUp)">
+        &#9664; Prev
+      </button>
+      <span id="pageinfo">– / –</span>
+      <button id="next" title="Next slide (Right/Space/PageDown)">
+        Next &#9654;
+      </button>
+      <button
+        id="openAudience"
+        title="Open the audience window (official pdf.js viewer — animations play)"
+      >
+        Open audience window
+      </button>
+      <span
+        id="timer"
+        title="click to reset to 00:00 (restarts on next page turn)"
+        >00:00</span
+      >
+      <button
+        id="resetTimer"
+        title="Reset the timer to 00:00 (restarts on next page turn)"
+      >
+        &#8635;
+      </button>
+      <span id="status">pick your presentation PDF below</span>
+    </div>
+    <div id="filebar">
+      <label for="pdfFile">Presentation PDF (slide | notes):</label>
+      <input type="file" id="pdfFile" accept="application/pdf,.pdf" />
+    </div>
+    <div id="main">
+      <div id="noteswrap"></div>
+      <div id="slidewrap"></div>
+    </div>
+    <div id="overlay">
+      <div class="card">
+        <h1>Presenter console</h1>
+        <p>
+          Pick your <b>presentation PDF</b> — the double-width
+          slide&nbsp;|&nbsp;notes build (from
+          <code>..._presentation_notes.tex</code>). The console shows the
+          notes (right half) and a slide preview (left half); the audience
+          window receives a cropped slide-only copy — animations included.
+        </p>
+        <button id="pickPdf">Browse PDF…</button>
+        <button id="loadSample" title="Fetch the bundled sample deck">
+          Try sample deck
+        </button>
+        <p id="overlayStatus"></p>
+      </div>
+    </div>
+
+    <script type="module">
+      import * as pdfjsLib from "./build/pdf.mjs";
+      import * as pdfLib from "./pdf-lib.esm.min.js";
+      import { renderHalf, makeTimer } from "./screen.js";
+      pdfjsLib.GlobalWorkerOptions.workerSrc = "./build/pdf.worker.mjs";
+
+      const $ = (id) => document.getElementById(id);
+
+      // ---- state --------------------------------------------------------------
+      let notesPdf = null; // double-width notes document (console rendering)
+      let pdfBytes = null; // Uint8Array of the picked PDF
+      let audience = null; // popup window (official viewer)
+      let audienceReady = false; // viewer loaded the pushed deck
+      let page = 1,
+        total = 0;
+      const timer = makeTimer($("timer"));
+
+      function setStatus(msg) {
+        $("status").textContent = msg;
+      }
+
+      // ---- file picker ---------------------------------------------------------
+      // ONE picker: the double-width notes PDF.  The console renders its
+      // halves; the audience deck (left halves, animations preserved) is
+      // derived from it in-browser with pdf-lib CropBox surgery.
+      async function loadFile(file) {
+        try {
+          setStatus("loading PDF…");
+          pdfBytes = new Uint8Array(await file.arrayBuffer());
+          const doc = await pdfjsLib.getDocument({
+            data: pdfBytes.slice(),
+          }).promise;
+          if (notesPdf) notesPdf.destroy();
+          notesPdf = doc;
+          total = doc.numPages;
+          $("overlayStatus").textContent = file.name;
+          setStatus(`ready — ${total} pages`);
+          $("overlay").style.display = "none";
+          page = 1;
+          timer.reset();
+          await showPage(1);
+          // If the audience window is already open, push the new deck to it.
+          if (audience && !audience.closed && audienceReady) pushDeck();
+        } catch (e) {
+          console.error(e);
+          setStatus("failed to load PDF: " + (e.message || e));
+        }
+      }
+      $("pdfFile").addEventListener("change", (ev) => {
+        if (ev.target.files[0]) loadFile(ev.target.files[0]);
+      });
+      $("pickPdf").addEventListener("click", () => $("pdfFile").click());
+      // Fetch the bundled sample deck — works under serve.py and on the
+      // GitHub Pages demo alike (same-origin fetch).
+      async function loadSample() {
+        try {
+          $("overlayStatus").textContent = "downloading sample deck…";
+          const r = await fetch("./sample.pdf");
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const buf = new Uint8Array(await r.arrayBuffer());
+          await loadFile(
+            new File([buf], "sample.pdf", { type: "application/pdf" }),
+          );
+        } catch (e) {
+          $("overlayStatus").textContent =
+            "sample deck unavailable: " + (e.message || e);
+        }
+      }
+      $("loadSample").addEventListener("click", loadSample);
+      document.body.addEventListener("dragover", (ev) => ev.preventDefault());
+      document.body.addEventListener("drop", (ev) => {
+        ev.preventDefault();
+        if (ev.dataTransfer.files[0]) loadFile(ev.dataTransfer.files[0]);
+      });
+
+      // Derive the audience deck: same document with every page cropped
+      // to its LEFT (slide) half.  CropBox surgery keeps page objects (and
+      // their /Annots — animate widgets), document JS (/Names, /OpenAction)
+      // and links intact, so PDF-JavaScript animations still play.
+      // Single-width pages (a regular deck picked by mistake) pass through
+      // untouched.
+      async function makeAudienceDeck() {
+        const { PDFDocument } = pdfLib;
+        const doc = await PDFDocument.load(pdfBytes, {
+          ignoreEncryption: true,
+        });
+        for (const p of doc.getPages()) {
+          const { width, height } = p.getSize();
+          if (width / height > 16 / 9 + 0.01) {
+            const mb = p.getMediaBox();
+            p.setCropBox(mb.x, mb.y, width / 2, height);
+          }
+        }
+        return await doc.save();
+      }
+
+      async function pushDeck() {
+        try {
+          setStatus("preparing audience deck…");
+          const bytes = await makeAudienceDeck();
+          audience.postMessage({ type: "load", data: bytes }, "*");
+          setStatus("deck pushed to audience window");
+        } catch (e) {
+          console.error(e);
+          setStatus("failed to build audience deck: " + e.message);
+        }
+      }
+
+      // ---- audience window (official pdf.js viewer: animations play) ----------
+      // The viewer URL has no ?file= — we wait for the shim to signal
+      // readiness, then push the cropped deck bytes to it.  Keeps the page
+      // fully static.
+      const AUDIENCE_URL = "web/viewer.html";
+
+      function openAudience() {
+        if (audience && !audience.closed) {
+          audience.focus();
+          return;
+        }
+        audienceReady = false;
+        audience = window.open(
+          AUDIENCE_URL,
+          "audience",
+          "popup=yes,width=1280,height=720",
+        );
+        if (!audience) {
+          setStatus("popup blocked — allow pop-ups and retry");
+          return;
+        }
+        setStatus("audience window opening… (waiting for viewer)");
+      }
+      $("openAudience").addEventListener("click", openAudience);
+
+      function sendGoto(n) {
+        if (audience && !audience.closed)
+          audience.postMessage({ type: "goto", page: n }, "*");
+      }
+
+      // Messages from the audience viewer (via viewer-shim.js):
+      //   ready      → shim is up; push the deck if we have it
+      //   loaded     → viewer finished opening the pushed deck
+      //   pagechange → page turned inside the audience window
+      window.addEventListener("message", (ev) => {
+        const d = ev.data;
+        if (!d || typeof d !== "object") return;
+        if (!(audience && ev.source === audience)) return;
+        switch (d.type) {
+          case "ready":
+            if (pdfBytes) pushDeck();
+            else setStatus("audience window ready — pick a PDF first");
+            break;
+          case "loaded":
+            audienceReady = true;
+            setStatus("audience window ready");
+            sendGoto(page); // align it with where we are
+            break;
+          case "pagechange":
+            if (d.total) total = d.total;
+            page = d.page;
+            timer.start();
+            showPage(page);
+            break;
+        }
+      });
+
+      // ---- controls -----------------------------------------------------------
+      function goTo(n) {
+        if (!notesPdf || n < 1 || n > total) return;
+        page = n;
+        timer.start();
+        showPage(page);
+        sendGoto(page);
+      }
+      const next = () => goTo(page + 1);
+      const prev = () => goTo(page - 1);
+      $("next").addEventListener("click", next);
+      $("prev").addEventListener("click", prev);
+
+      // Reset the timer to 00:00 (stopped); it restarts on the next
+      // page turn, so a reset right before starting keeps a clean 00:00.
+      function resetTimer() {
+        timer.reset();
+      }
+      $("resetTimer").addEventListener("click", resetTimer);
+      $("timer").addEventListener("click", resetTimer);
+
+      window.addEventListener("keydown", (ev) => {
+        if (ev.target && /^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName))
+          return;
+        if (!notesPdf) return;
+        switch (ev.key) {
+          case " ":
+          case "ArrowRight":
+          case "PageDown":
+          case "n":
+            ev.preventDefault();
+            next();
+            break;
+          case "ArrowLeft":
+          case "PageUp":
+          case "p":
+            ev.preventDefault();
+            prev();
+            break;
+        }
+      });
+
+      async function showPage(n) {
+        $("pageinfo").textContent = total ? `${n} / ${total}` : `${n}`;
+        if (!notesPdf) return;
+        try {
+          await Promise.all([
+            renderHalf(notesPdf, n, "right", $("noteswrap")), // notes half
+            renderHalf(notesPdf, n, "left", $("slidewrap")), // slide preview
+          ]);
+        } catch (e) {
+          console.error(e);
+          setStatus("render error: " + e.message);
+        }
+      }
+
+      window.addEventListener("resize", () => {
+        if (notesPdf && page) showPage(page);
+      });
+    </script>
+  </body>
+</html>

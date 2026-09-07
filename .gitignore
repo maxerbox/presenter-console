@@ -1,0 +1,13 @@
+# LaTeX build artifacts (sample.tex is compiled manually into sample.pdf)
+sample.aux
+sample.log
+sample.nav
+sample.out
+sample.snm
+sample.toc
+sample.vrb
+sample.xdv
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
