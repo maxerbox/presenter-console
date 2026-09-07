@@ -12,7 +12,7 @@
 % Bare note pages: no beamer chrome, small font (same layout idea as the
 % real deck this console was built for).
 \setbeamertemplate{note page}{%
-  \vfill\footnotesize\raggedright\insertnote\par\vfill}
+\vfill\footnotesize\raggedright\insertnote\par\vfill}
 
 \begin{document}
 
@@ -24,14 +24,29 @@
     PDF. Turn pages with the arrow keys or the buttons; the timer
     starts on your first page turn (reset it with the button next to
     it). Drag the separators to resize the three panes; double-click a
-    separator to reset.}
+  separator to reset.}
 \end{frame}
 
 \begin{frame}{Animated pgfplots: policy training}
   \begin{center}
-    \begin{animateinline}[autoplay,loop]{12}
-      \multiframe{10}{i=0+1}{%
+    % 36 frames @ 12fps = 3 s loop.  The animate package has NO built-in
+    % frame transitions (hard cuts only), so fluid fades are baked into
+    % the frames themselves:
+    %   - data fades in over frames 0-5 (appearing transition),
+    %   - holds at full opacity,
+    %   - fades out over frames 32-35 so the loop wrap blends into the
+    %     fade-in of frame 0 (seamless loop, no hard cut),
+    %   - a dot rides each curve frontier to accent the motion.
+    % poster=31: the static appearance (console preview pane, printing,
+    % viewers without JS) shows a nearly complete chart instead of the
+    % blank first fade frame.
+    \begin{animateinline}[autoplay,loop,poster=31]{12}
+      \multiframe{36}{i=0+1}{%
         \begin{tikzpicture}
+          \pgfmathsetmacro{\af}{\i<6 ? \i/5 : (\i>31 ? (35-\i)/3 : 1)}
+          \pgfmathsetmacro{\X}{100*(\i+1)/36}
+          \pgfmathsetmacro{\yA}{1 - 2*exp(-\X/38) + 0.1*sin(deg(3*\X/10))}
+          \pgfmathsetmacro{\yB}{-1 + 2*(1 - exp(-\X/55)) + 0.08*cos(deg(\X/12))}
           \begin{axis}[
               width=0.72\textwidth,
               height=0.62\textheight,
@@ -44,23 +59,34 @@
               legend pos=south east,
               legend style={font=\scriptsize},
             ]
-            % Smooth learning curve, progressively revealed: the frame
-            % counter \i (0..9) extends the drawn portion of the run.
-            \addplot[thick, blue, domain=0:{10*\i+10}, samples=40,
-                     smooth] {1 - 2*exp(-x/38) + 0.1*sin(deg(3*x/10))};
+            % Smooth learning curves, progressively revealed with a
+            % fade-in/out envelope (\af) for fluid appearing transitions.
+            \addplot[thick, blue, domain=0:\X, samples=50,
+            smooth, opacity=\af]
+            {1 - 2*exp(-x/38) + 0.1*sin(deg(3*x/10))};
             \addlegendentry{policy}
-            \addplot[dashed, orange, domain=0:{10*\i+10}, samples=40,
-                     smooth] {-1 + 2*(1 - exp(-x/55)) + 0.08*cos(deg(x/12))};
+            \addplot[dashed, orange, domain=0:\X, samples=50,
+            smooth, opacity=\af]
+            {-1 + 2*(1 - exp(-x/55)) + 0.08*cos(deg(x/12))};
             \addlegendentry{baseline}
+            % Frontier dots riding the leading edge of each curve.
+            \addplot[only marks, mark=*, mark size=1.5pt,
+            blue, opacity=\af] coordinates {(\X,\yA)};
+            \addplot[only marks, mark=*, mark size=1.5pt,
+            orange, opacity=\af] coordinates {(\X,\yB)};
           \end{axis}
-        \end{tikzpicture}}
+      \end{tikzpicture}}
     \end{animateinline}
   \end{center}
-  \note{This is a pgfplots chart animated with the animate package: each
-    frame extends the drawn portion of two training curves, like watching
-    a run progress. The audience deck is derived with pdf-lib CropBox
+  \note{This is a pgfplots chart animated with the animate package: the
+    two training curves are progressively revealed, like watching a run
+    progress. The motion is kept fluid by baking opacity ramps into the
+    frames (the animate package has no built-in frame transitions): the
+    data fades in at the start of each loop, fades out at the end ---
+    so the loop wraps without a hard cut --- and a dot rides each
+    curve's frontier. The audience deck is derived with pdf-lib CropBox
     surgery, which keeps the widget annotations --- so the animation
-    still plays in the audience window (official pdf.js viewer).}
+  still plays in the audience window (official pdf.js viewer).}
 \end{frame}
 
 \begin{frame}{Pick your own deck}
@@ -68,7 +94,7 @@
   for example beamer's \texttt{show notes on second screen=right}.
   \note{Slides without a \texttt{\textbackslash note\{\}} show an empty
     right half in the console --- that is content, not a bug. The
-    next-slide pane on the far right previews what comes next.}
+  next-slide pane on the far right previews what comes next.}
 \end{frame}
 
 \end{document}
