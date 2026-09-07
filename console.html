@@ -4,14 +4,16 @@
     <meta charset="utf-8" />
     <title>Presenter console</title>
     <!-- Static page: pick ONE PDF — the double-width presentation build
-         (slide | notes, from ..._presentation_notes.tex).  The console
-         shows the notes (right half) + slide preview (left half); the
-         audience window runs the OFFICIAL pdf.js viewer and receives a
-         cropped slide-only copy of the same PDF (CropBox surgery keeps
+         (slide | notes, from ..._presentation_notes.tex).  Layout (all
+         separators draggable, double-click to reset, sizes saved to
+         localStorage):
+           [ notes | current slide | next slide ]
+         The audience window runs the OFFICIAL pdf.js viewer and receives
+         a cropped slide-only copy of the same PDF (CropBox surgery keeps
          document JS and widgets, so animate-package animations play).
          Everything stays on your machine.  Serve over http:// (python
-         presenter/serve.py) so ES modules and the pdf.js worker can
-         load; file:// will NOT work. -->
+         serve.py) so ES modules and the pdf.js worker can load; file://
+         will NOT work. -->
     <style>
       html,
       body {
@@ -85,28 +87,55 @@
         flex: 1 1 auto;
         display: flex;
         min-height: 0;
-      }
-      #noteswrap {
-        flex: 1 1 62%;
         min-width: 0;
+      }
+      .pane {
+        min-width: 0;
+        min-height: 0;
         display: flex;
         align-items: center;
         justify-content: center;
+        overflow: hidden;
         padding: 8px;
-        background: #262626;
       }
-      #noteswrap canvas,
-      #slidewrap canvas {
+      .pane canvas {
         display: block;
       }
-      #slidewrap {
-        flex: 0 0 30%;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: 8px;
+      #noteswrap {
+        background: #262626;
+      }
+      #slidewrap,
+      #nextwrap {
         background: #1a1a1a;
-        border-left: 1px solid #333;
+      }
+      /* Split.js gutters between the three panes */
+      .gutter {
+        flex: 0 0 5px;
+        background: #333;
+        cursor: col-resize;
+        position: relative;
+      }
+      .gutter::after {
+        content: "";
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 1px;
+        height: 34px;
+        transform: translate(-50%, -50%);
+        background: #666;
+      }
+      .gutter:hover,
+      .gutter.dragging {
+        background: #4a6a9a;
+      }
+      .gutter.dragging {
+        cursor: col-resize;
+      }
+      body.splitting,
+      body.splitting * {
+        cursor: col-resize !important;
+        user-select: none !important;
       }
       #overlay {
         position: fixed;
@@ -120,10 +149,10 @@
       #overlay .card {
         max-width: 640px;
         padding: 32px 40px;
-        text-align: center;
+        background: #232323;
         border: 1px solid #344;
         border-radius: 10px;
-        background: #232323;
+        text-align: center;
       }
       #overlay h1 {
         margin-top: 0;
@@ -133,6 +162,7 @@
         color: #9ab;
         font-size: 13px;
         line-height: 1.5;
+        margin: 10px 0;
       }
       #overlay button {
         margin: 6px;
@@ -182,8 +212,9 @@
       <input type="file" id="pdfFile" accept="application/pdf,.pdf" />
     </div>
     <div id="main">
-      <div id="noteswrap"></div>
-      <div id="slidewrap"></div>
+      <div id="noteswrap" class="pane"></div>
+      <div id="slidewrap" class="pane"></div>
+      <div id="nextwrap" class="pane"></div>
     </div>
     <div id="overlay">
       <div class="card">
@@ -192,8 +223,10 @@
           Pick your <b>presentation PDF</b> — the double-width
           slide&nbsp;|&nbsp;notes build (from
           <code>..._presentation_notes.tex</code>). The console shows the
-          notes (right half) and a slide preview (left half); the audience
-          window receives a cropped slide-only copy — animations included.
+          notes, a current-slide preview and a next-slide preview (drag
+          the separators to resize; double-click a separator to reset);
+          the audience window receives a cropped slide-only copy —
+          animations included.
         </p>
         <button id="pickPdf">Browse PDF…</button>
         <button id="loadSample" title="Fetch the bundled sample deck">
@@ -203,6 +236,7 @@
       </div>
     </div>
 
+    <script src="split.min.js"></script>
     <script type="module">
       import * as pdfjsLib from "./build/pdf.mjs";
       import * as pdfLib from "./pdf-lib.esm.min.js";
@@ -210,6 +244,55 @@
       pdfjsLib.GlobalWorkerOptions.workerSrc = "./build/pdf.worker.mjs";
 
       const $ = (id) => document.getElementById(id);
+
+      // ---- three resizable panes (Split.js) -------------------------------------
+      // Layout: [ notes | current slide | next slide ].  Pane sizes are
+      // percentages of #main, persisted to localStorage; double-click a
+      // separator to reset, drag to resize.
+      const DEFAULT_SIZES = [58, 24, 18];
+      const split = Split(["noteswrap", "slidewrap", "nextwrap"], {
+        sizes: loadSizes(),
+        minSize: [120, 100, 100],
+        gutterSize: 5,
+        gutter: (index, direction) => {
+          const g = document.createElement("div");
+          g.className = "gutter";
+          g.title = "drag to resize, double-click to reset";
+          g.addEventListener("dblclick", () => {
+            split.setSizes(DEFAULT_SIZES);
+            saveSizes(DEFAULT_SIZES);
+            rerender();
+          });
+          return g;
+        },
+        onDragStart() {
+          document.body.classList.add("splitting");
+        },
+        onDragEnd() {
+          document.body.classList.remove("splitting");
+          saveSizes(split.getSizes());
+          rerender();
+        },
+      });
+
+      function loadSizes() {
+        try {
+          const s = JSON.parse(localStorage.getItem("paneSizes"));
+          if (Array.isArray(s) && s.length === 3 && s.every((x) => x > 0)) {
+            return s;
+          }
+        } catch {}
+        return DEFAULT_SIZES;
+      }
+      function saveSizes(s) {
+        try {
+          localStorage.setItem("paneSizes", JSON.stringify(s));
+        } catch {}
+      }
+
+      function rerender() {
+        if (notesPdf && page) showPage(page);
+      }
 
       // ---- state --------------------------------------------------------------
       let notesPdf = null; // double-width notes document (console rendering)
@@ -244,7 +327,7 @@
           page = 1;
           timer.reset();
           await showPage(1);
-          // If the audience window is already open, push the new deck to it.
+          // If the audience window is already open, redirect it.
           if (audience && !audience.closed && audienceReady) pushDeck();
         } catch (e) {
           console.error(e);
@@ -416,8 +499,15 @@
         try {
           await Promise.all([
             renderHalf(notesPdf, n, "right", $("noteswrap")), // notes half
-            renderHalf(notesPdf, n, "left", $("slidewrap")), // slide preview
+            renderHalf(notesPdf, n, "left", $("slidewrap")), // current slide
           ]);
+          // Next-slide preview: render only if it fits the layout (skip on
+          // the last page).
+          if (n < total) {
+            renderHalf(notesPdf, n + 1, "left", $("nextwrap"));
+          } else {
+            $("nextwrap").replaceChildren();
+          }
         } catch (e) {
           console.error(e);
           setStatus("render error: " + e.message);
@@ -425,7 +515,7 @@
       }
 
       window.addEventListener("resize", () => {
-        if (notesPdf && page) showPage(page);
+        rerender();
       });
     </script>
   </body>
