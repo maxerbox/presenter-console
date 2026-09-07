@@ -28,7 +28,9 @@
     return true;
   }
 
-  // --- pdf.js presentation-mode animation fix (v4) --------------------
+  // --- pdf.js presentation-mode animation fix (v5) --------------------
+  // Part 3 (v5) additionally suppresses the poster-frame flash on page
+  // entry for autoplay animations — see the part-3 block below.
   // Two problems, one root cause: in presentation mode pdf.js fires
   // pagechanging 3x per turn (extra scale-change pass; mozilla/pdf.js
   // #15745, WONTFIX upstream).  The scripting manager runs its
@@ -124,17 +126,155 @@
     const attachObserver = (retries) => {
       const el = app.pdfViewer?.viewer;
       if (el) {
-        new MutationObserver(scheduleSync).observe(el, { childList: true });
+        new MutationObserver(() => {
+          scheduleSync();
+          // flip AFTER syncPendingDisplay's microtask so remembered
+          // raw-path writes apply first and the flip normalizes on top
+          Promise.resolve().then(suppressPosterFlash);
+        }).observe(el, {
+          childList: true,
+          subtree: true, // catch annotation layer / section attaches
+        });
         return;
       }
       if (retries > 0) setTimeout(() => attachObserver(retries - 1), 500);
     };
     attachObserver(20); // ~10s
-    app.eventBus.on("pagerendered", () => setTimeout(syncPendingDisplay, 0));
+    app.eventBus.on("pagerendered", () => {
+      suppressPosterFlash();
+      setTimeout(syncPendingDisplay, 0);
+    });
+    app.eventBus.on("pagechanging", () => suppressPosterFlash());
     app.eventBus.on("presentationmodechanged", (evt) => {
       inPresentationMode = evt.state > 0;
       if (!inPresentationMode) setTimeout(syncPendingDisplay, 150);
     });
+
+    // --- poster-flash suppression for autoplay animations (part 3) ---
+    // animate's [autoplay,poster=last] PDFs REST on the final frame
+    // (the poster): every frame widget except the poster is /F 2
+    // (hidden).  pdf.js paints that static state the moment a page's
+    // annotation layer attaches, but the animate PageOpen JS only
+    // runs ~100ms later (render FINISHED + sandbox round-trip), so
+    // the audience briefly sees the FINAL frame — the faint "arrows
+    // on the first frame" flash — before frame 0 appears and
+    // playback starts.  Fix: when a layer attaches and an autoplay
+    // animation sits in its pristine poster state, pre-apply the very
+    // display change the PageOpen JS is about to make (poster hidden,
+    // frame 0 visible) inside the same microtask as the attach
+    // mutation — before the browser can paint.  Screen-only (inline
+    // styles only, no annotationStorage writes): printing and the
+    // later real JS state are unaffected, and layer rebuilds re-run
+    // the flip via the same observer.
+    let animMap = null; // [{page, frames:[{k,id}], firstId, posterId, autoplay}]
+    let animMapPromise = null;
+    const ensureAnimMap = () => {
+      const doc = app.pdfDocument;
+      if (animMapPromise || !doc) return;
+      animMapPromise = (async () => {
+        let fields = null;
+        try {
+          fields = await doc.getFieldObjects();
+        } catch (e) {
+          return;
+        }
+        if (!fields || typeof fields.entries !== "function") return;
+        // frame widgets are named "<animNum>.<k>" on the anm's page
+        const framesByName = new Map();
+        for (const [name, arr] of fields.entries()) {
+          const m = /^(\d+)\.(\d+)$/.exec(name);
+          if (m && arr && arr.length) {
+            framesByName.set(name, {
+              n: m[1],
+              k: +m[2],
+              id: arr[0].id,
+              page: arr[0].page,
+            });
+          }
+        }
+        const map = [];
+        for (const [name, arr] of fields.entries()) {
+          const m = /^anm(\d+)$/.exec(name);
+          if (!m || !arr || !arr.length) continue;
+          const n = m[1];
+          const main = arr[0];
+          const frames = [];
+          for (const fr of framesByName.values()) {
+            if (fr.n === n && fr.page === main.page) frames.push(fr);
+          }
+          if (!frames.length) continue;
+          frames.sort((a, b) => a.k - b.k);
+          // autoplay: the /PO script ends with an UNCONDITIONAL
+          // playFwd/playBwd dispatch (autoresume wraps it in isPaused,
+          // button-controlled animations have no play call at all)
+          let autoplay = false;
+          try {
+            const po = main.actions?.get?.("PageOpen");
+            const js = Array.isArray(po) ? po.join("\n") : "";
+            autoplay = js.endsWith(
+              "_playsRight){a" + n + "_playFwd();}else{a" + n + "_playBwd();}"
+            );
+          } catch (e) {}
+          map.push({
+            page: main.page + 1,
+            frames,
+            firstId: frames[0].id,
+            posterId: frames[frames.length - 1].id,
+            autoplay,
+          });
+        }
+        if (app.pdfDocument === doc) {
+          animMap = map;
+          // the current page's layer may have attached while the
+          // field-object round-trip was in flight — flip it now
+          suppressPosterFlash();
+        }
+      })();
+    };
+    const applyAnimDisplay = (section, id, visible) => {
+      section.style.visibility = visible ? "visible" : "hidden";
+      // direct write invalidates any pending raw-path write (the
+      // shim's rule: fresh state always wins over remembered state)
+      pendingDisplay.delete(id);
+    };
+    const suppressPosterFlash = () => {
+      if (!animMap || !animMap.length) return;
+      for (const anim of animMap) {
+        if (!anim.autoplay) continue;
+        const pageDiv = document.querySelector(
+          '[data-page-number="' + anim.page + '"]'
+        );
+        const layer = pageDiv?.querySelector(".annotationLayer");
+        if (!layer) continue;
+        let posterSection = null,
+          posterVisible = false,
+          firstSection = null,
+          visibleCount = 0,
+          complete = true;
+        for (const fr of anim.frames) {
+          const sec = layer.querySelector(
+            '[data-annotation-id="' + fr.id + '"]'
+          );
+          if (!sec) {
+            complete = false;
+            break;
+          }
+          const vis = getComputedStyle(sec).visibility !== "hidden";
+          if (fr.id === anim.posterId) {
+            posterSection = sec;
+            posterVisible = vis;
+          }
+          if (fr.id === anim.firstId) firstSection = sec;
+          if (vis) visibleCount++;
+        }
+        if (!complete || !posterSection || !firstSection) continue;
+        if (!posterVisible || visibleCount !== 1) continue; // not pristine
+        // pristine poster state: pre-apply the PageOpen JS's first
+        // display change (playFwd -> stopFirst -> seekFrame(0))
+        applyAnimDisplay(posterSection, anim.posterId, false);
+        applyAnimDisplay(firstSection, anim.firstId, true);
+      }
+    };
 
     const hookStorage = (pdfDocument) => {
       const storage = pdfDocument?.annotationStorage;
@@ -210,8 +350,11 @@
           sandboxOpenPage = null;
           logicalPage = null;
           pendingDisplay.clear();
+          animMap = null;
+          animMapPromise = null;
           const r = origCreateSandbox(...sargs);
           hookStorage(app.pdfDocument);
+          ensureAnimMap();
           return r;
         };
       }
