@@ -12840,8 +12840,9 @@ class CanvasGraphics {
         const {
           viewportScale
         } = this;
-        const canvasWidth = Math.ceil(width * this.outputScaleX * viewportScale);
-        const canvasHeight = Math.ceil(height * this.outputScaleY * viewportScale);
+        const annotSupersample = globalThis.ANNOTATION_SUPERSAMPLE ?? 2;
+        const canvasWidth = Math.ceil(width * this.outputScaleX * viewportScale * annotSupersample);
+        const canvasHeight = Math.ceil(height * this.outputScaleY * viewportScale * annotSupersample);
         this.annotationCanvas = this.canvasFactory.create(canvasWidth, canvasHeight);
         const {
           canvas,
@@ -12862,7 +12863,7 @@ class CanvasGraphics {
         this.annotationCanvas.savedCtx = this.ctx;
         this.ctx = context;
         this.ctx.save();
-        this.ctx.setTransform(XY[0], 0, 0, -XY[1], 0, height * XY[1]);
+        this.ctx.setTransform(XY[0] * annotSupersample, 0, 0, -XY[1] * annotSupersample, 0, height * XY[1] * annotSupersample);
         resetCtxToDefault(this.ctx);
       } else {
         resetCtxToDefault(this.ctx);
