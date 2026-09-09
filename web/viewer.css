@@ -8204,3 +8204,32 @@ dialog :link{
     display:none;
   }
 }
+
+
+/* --- presenter-console tools overlay (viewer-shim.js) ---------------- */
+/* Red pointer dot mirrored from the presenter console. */
+.pc-laser-dot {
+  position: absolute;
+  display: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(255, 31, 31, 0.55);
+  border: 2px solid rgba(255, 255, 255, 0.9);
+  box-shadow: 0 0 12px 4px rgba(255, 31, 31, 0.5);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 100000;
+}
+
+/* Marker strokes mirrored from the presenter console (normalized 0-1
+   coordinates in a 1000x1000 viewBox, stretched to the page div). */
+.pc-ink-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 100000;
+  overflow: visible;
+}

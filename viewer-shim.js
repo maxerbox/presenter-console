@@ -10,6 +10,10 @@
 //   → {type:"pagechange",page,total}    page turned inside the viewer
 //   ← {type:"load", data:Uint8Array}    deck bytes to open (static mode)
 //   ← {type:"goto", page:N}             jump to page N
+//   ← {type:"pointer", x,y,visible}     red pointer position (normalized)
+//   ← {type:"tools", laser, marker}     pointer/marker toggle state
+//   ← {type:"strokes", page, list}      marker strokes for a page
+//   ← {type:"strokesClearAll"}          every marker stroke deleted
 (function () {
   "use strict";
   const opener = window.opener;
@@ -19,12 +23,177 @@
     opener.postMessage(msg, "*");
   }
 
+  // --- presenter tools overlay (pointer + marker) --------------------
+  // Screen-only layer per page div: a red dot for the pointer and an
+  // SVG with the marker strokes (normalized coordinates).  Injected on
+  // demand and re-injected on every layer attach (pdf.js rebuilds page
+  // children during zoom/Presentation Mode), same MutationObserver
+  // pattern as the animation fix.  Purely visual: no annotationStorage
+  // writes, so printing and animations are untouched.
+  const toolsOverlay = {
+    laserOn: false,
+    markerOn: false,
+    pointer: { x: 0.5, y: 0.5, visible: false },
+    strokes: new Map(), // page -> [ {pts, color, width} ]
+    dot: null,
+    svg: null,
+  };
+
+  function removeToolsOverlay() {
+    toolsOverlay.dot?.remove();
+    toolsOverlay.svg?.remove();
+    toolsOverlay.dot = null;
+    toolsOverlay.svg = null;
+    toolsOverlay.pageDiv = null;
+  }
+
+  function ensureToolsOverlay(pageDiv) {
+    if (!pageDiv) return;
+    // Re-inject when the page div changes OR when pdf.js rebuilt the
+    // div's children (replaceChildren drops appended overlays).
+    if (
+      toolsOverlay.dot &&
+      toolsOverlay.pageDiv === pageDiv &&
+      pageDiv.contains(toolsOverlay.dot)
+    )
+      return;
+    removeToolsOverlay();
+    toolsOverlay.pageDiv = pageDiv;
+    const dot = document.createElement("div");
+    dot.className = "pc-laser-dot";
+    const svg = document.createElementNS(
+      "http://www.w3.org/2000/svg",
+      "svg"
+    );
+    svg.setAttribute("class", "pc-ink-svg");
+    svg.setAttribute("preserveAspectRatio", "none");
+    svg.setAttribute("viewBox", "0 0 1000 1000");
+    toolsOverlay.dot = dot;
+    toolsOverlay.svg = svg;
+    pageDiv.append(dot, svg);
+    applyPointer();
+    renderStrokes();
+  }
+
+  function applyPointer() {
+    const dot = toolsOverlay.dot;
+    if (!dot) return;
+    if (!toolsOverlay.laserOn || !toolsOverlay.pointer.visible) {
+      dot.style.display = "none";
+      return;
+    }
+    dot.style.left = toolsOverlay.pointer.x * 100 + "%";
+    dot.style.top = toolsOverlay.pointer.y * 100 + "%";
+    dot.style.display = "block";
+  }
+
+  function renderStrokes() {
+    const svg = toolsOverlay.svg;
+    if (!svg) return;
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    const list = toolsOverlay.strokes.get(currentPageNumber()) || [];
+    for (const s of list) {
+      if (!s.pts || !s.pts.length) continue;
+      const path = document.createElementNS(
+        "http://www.w3.org/2000/svg",
+        "path"
+      );
+      let d = `M ${s.pts[0][0] * 1000} ${s.pts[0][1] * 1000}`;
+      for (let i = 1; i < s.pts.length; i++) {
+        d += ` L ${s.pts[i][0] * 1000} ${s.pts[i][1] * 1000}`;
+      }
+      path.setAttribute("d", d);
+      path.setAttribute("fill", "none");
+      path.setAttribute("stroke", s.color || "rgba(230,30,30,0.9)");
+      path.setAttribute("stroke-width", (s.width || 0.0045) * 1000);
+      path.setAttribute("stroke-linecap", "round");
+      path.setAttribute("stroke-linejoin", "round");
+      path.setAttribute("vector-effect", "non-scaling-stroke");
+      svg.appendChild(path);
+    }
+  }
+
+  // Track the CURRENT page div: overlays must live inside it so page
+  // scrolling/zoom transforms them with the slide.
+  function currentPageNumber() {
+    const app = toolsOverlay.app || window.PDFViewerApplication;
+    return app?.pdfViewer?.currentPageNumber ?? toolsOverlay.page;
+  }
+
+  function currentPageDiv() {
+    const n = currentPageNumber();
+    if (!n) return null;
+    return document.querySelector(`[data-page-number="${n}"]`);
+  }
+
+  function syncToolsOverlay() {
+    ensureToolsOverlay(currentPageDiv());
+  }
+
   function wire(app) {
     if (!app || !app.eventBus) return false;
     app.eventBus.on("pagechanging", (evt) => {
       post({ type: "pagechange", page: evt.pageNumber, total: app.pagesCount });
+      syncToolsOverlay();
+      renderStrokes();
     });
     patchScriptingForPresentationMode(app);
+    toolsOverlay.app = app;
+    // Overlays must follow the viewer's own page rebuilds (zoom, PM
+    // entry/exit): re-inject when the current page div changes children.
+    // Debounced — pdf.js rebuilds many children in bursts during zoom.
+    let syncScheduled = false;
+    const scheduleSync = () => {
+      if (syncScheduled) return;
+      syncScheduled = true;
+      Promise.resolve().then(() => {
+        syncScheduled = false;
+        syncToolsOverlay();
+      });
+    };
+    const attachWatcher = () => {
+      const viewer = app.pdfViewer?.viewer;
+      if (viewer) {
+        new MutationObserver(scheduleSync).observe(viewer, {
+          childList: true,
+          subtree: true,
+        });
+        return;
+      }
+      setTimeout(attachWatcher, 500);
+    };
+    attachWatcher();
+    // Hovering the AUDIENCE window itself drives the pointer too: the
+    // presenter may stand at the podium machine.  Normalized against the
+    // current page's canvasWrapper (= exactly the rendered slide area),
+    // mirrored back to the console so its preview dot follows as well.
+    let hoverFrame = null;
+    let hoverPending = null;
+    document.addEventListener("pointermove", (ev) => {
+      if (!toolsOverlay.laserOn) return;
+      const pageDiv = currentPageDiv();
+      const cw = pageDiv?.querySelector(":scope > .canvasWrapper");
+      if (!cw) return;
+      const r = cw.getBoundingClientRect();
+      if (!r.width || !r.height) return;
+      const x = (ev.clientX - r.left) / r.width;
+      const y = (ev.clientY - r.top) / r.height;
+      const inside = x >= 0 && x <= 1 && y >= 0 && y <= 1;
+      hoverPending = { x, y, visible: inside };
+      if (hoverFrame !== null) return;
+      hoverFrame = requestAnimationFrame(() => {
+        hoverFrame = null;
+        toolsOverlay.pointer = hoverPending;
+        applyPointer();
+        post({ type: "pointerFromAudience", ...hoverPending });
+      });
+    });
+    document.addEventListener("pointerleave", () => {
+      if (!toolsOverlay.laserOn) return;
+      toolsOverlay.pointer = { x: 0, y: 0, visible: false };
+      applyPointer();
+      post({ type: "pointerFromAudience", x: 0, y: 0, visible: false });
+    });
     return true;
   }
 
@@ -374,11 +543,25 @@
   }
   tryWire(80); // ~20s
 
+  // Heartbeat: the console page can reload (F5) and lose its reference
+  // to this popup.  A periodic hello lets a reloaded console re-adopt
+  // this window and re-push the deck; the console ignores hellos while
+  // everything is already in sync.
+  setInterval(() => {
+    try {
+      if (!opener.closed) post({ type: "hello" });
+    } catch {}
+  }, 2000);
+
   window.addEventListener("message", (ev) => {
     const d = ev.data;
     if (!d || typeof d !== "object") return;
     const app = window.PDFViewerApplication;
     if (d.type === "load" && app && app.open) {
+      // New deck: drop any presenter-tools state tied to the old one.
+      removeToolsOverlay();
+      toolsOverlay.strokes.clear();
+      toolsOverlay.pointer = { x: 0, y: 0, visible: false };
       // Push the picked deck bytes into the official viewer.  Copy the
       // buffer: pdf.js transfers/detaches the ArrayBuffer it renders.
       const data =
@@ -391,6 +574,19 @@
         });
     } else if (d.type === "goto") {
       if (app && app.pdfViewer) app.pdfViewer.currentPageNumber = d.page;
+    } else if (d.type === "pointer") {
+      toolsOverlay.pointer = { x: d.x, y: d.y, visible: d.visible };
+      applyPointer();
+    } else if (d.type === "tools") {
+      toolsOverlay.laserOn = !!d.laser;
+      toolsOverlay.markerOn = !!d.marker;
+      applyPointer();
+    } else if (d.type === "strokes") {
+      toolsOverlay.strokes.set(d.page, d.list || []);
+      if (d.page === currentPageNumber()) renderStrokes();
+    } else if (d.type === "strokesClearAll") {
+      toolsOverlay.strokes.clear();
+      renderStrokes();
     }
   });
 })();

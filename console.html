@@ -50,6 +50,50 @@
       #topbar button:hover {
         background: #444;
       }
+      #topbar button:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+      #topbar button.tool-btn.active {
+        background: #5a3030;
+        border-color: #c66;
+        color: #ffd9d9;
+      }
+      #slidewrap.marker-cursor {
+        cursor: crosshair;
+      }
+      /* Stage wrapping the current-slide canvas: hosts the marker
+         overlay canvas and the console-local laser dot on top of the
+         rendered PDF half. */
+      .slide-stage {
+        position: relative;
+        width: 100%;
+        height: 100%;
+      }
+      /* Marker overlay: same buffer size as the PDF canvas and the same
+         object-fit:contain letterboxing, so both images coincide exactly
+         and normalized (0-1) stroke coordinates map 1:1. */
+      .ink-overlay {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        pointer-events: none;
+      }
+      .laser-dot {
+        position: absolute;
+        display: none;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: rgba(255, 31, 31, 0.55);
+        border: 2px solid rgba(255, 255, 255, 0.9);
+        box-shadow: 0 0 10px 3px rgba(255, 31, 31, 0.5);
+        transform: translate(-50%, -50%);
+        pointer-events: none;
+        z-index: 5;
+      }
       #pageinfo {
         min-width: 90px;
         text-align: center;
@@ -241,6 +285,30 @@
       >
         &#8635;
       </button>
+      <button
+        id="laserToggle"
+        class="tool-btn"
+        title="Red pointer: shown on the audience slide while you hover the current slide here (or the audience window itself)"
+      >
+        &#9678; Pointer
+      </button>
+      <button
+        id="markerToggle"
+        class="tool-btn"
+        title="Marker: draw on the current slide — kept per page, shown in the audience window, survives reloads"
+      >
+        &#9998; Marker
+      </button>
+      <button
+        id="undoInk"
+        title="Undo the last marker action (Ctrl+Z)"
+        disabled
+      >
+        &#8630; Undo
+      </button>
+      <button id="clearInk" title="Delete ALL marker strokes" disabled>
+        &#128465;
+      </button>
       <span id="status">pick your presentation PDF below</span>
     </div>
     <div id="filebar">
@@ -382,6 +450,12 @@
         try {
           setStatus("loading PDF…");
           pdfBytes = new Uint8Array(await file.arrayBuffer());
+          // Per-deck identity for the marker storage (FNV-1a of the
+          // bytes) + a fresh undo history.
+          docKey = fnv1a(pdfBytes);
+          inkHistory = [];
+          loadInk();
+          updateInkButtons();
           const doc = await pdfjsLib.getDocument({
             data: pdfBytes.slice(),
           }).promise;
@@ -395,7 +469,7 @@
           timer.reset();
           await showPage(1);
           // If the audience window is already open, redirect it.
-          if (audience && !audience.closed && audienceReady) pushDeck();
+          if (audience && !audience.closed) pushDeck();
         } catch (e) {
           console.error(e);
           setStatus("failed to load PDF: " + (e.message || e));
@@ -498,22 +572,50 @@
       window.addEventListener("message", (ev) => {
         const d = ev.data;
         if (!d || typeof d !== "object") return;
+        if (ev.origin !== location.origin) return;
+        // hello/ready from an unknown same-origin window: the audience
+        // viewer saying hi (e.g. after this page reloaded and lost its
+        // popup reference) — adopt it.
+        if (
+          (d.type === "hello" || d.type === "ready") &&
+          ev.source &&
+          ev.source !== audience
+        ) {
+          audience = ev.source;
+          audienceReady = false;
+        }
         if (!(audience && ev.source === audience)) return;
         switch (d.type) {
           case "ready":
-            if (pdfBytes) pushDeck();
-            else setStatus("audience window ready — pick a PDF first");
+          case "hello":
+            if (!audienceReady) {
+              if (pdfBytes) pushDeck();
+              else setStatus("audience window ready — pick a PDF first");
+            }
             break;
           case "loaded":
             audienceReady = true;
             setStatus("audience window ready");
             sendGoto(page); // align it with where we are
+            sendTools(); // pointer/marker toggle state
+            pushStrokes(page); // marker strokes for the current page
             break;
           case "pagechange":
+            if (!audienceReady) break; // deck re-opening — realigned on "loaded"
             if (d.total) total = d.total;
             page = d.page;
             timer.start();
             showPage(page);
+            break;
+          case "pointerFromAudience":
+            // The presenter is hovering the audience window itself:
+            // mirror the dot on the console's slide preview too.
+            if (d.visible && laserDot) {
+              positionDot({ nx: d.x, ny: d.y });
+              laserDot.style.display = "block";
+            } else if (laserDot) {
+              laserDot.style.display = "none";
+            }
             break;
         }
       });
@@ -575,6 +677,12 @@
           } else {
             $("nextwrap").replaceChildren();
           }
+          // Wrap the fresh current-slide canvas in the marker stage,
+          // repaint persisted strokes and keep the audience's stroke
+          // list for this page in sync.
+          buildSlideStage();
+          redrawInk();
+          pushStrokes(n);
         } catch (e) {
           console.error(e);
           setStatus("render error: " + e.message);
@@ -584,6 +692,336 @@
       window.addEventListener("resize", () => {
         rerender();
       });
+
+      // ---- presenter tools: red pointer + marker (persisted per deck) ----
+      // Pointer: while ON, hovering the current slide here (or the
+      // audience window itself) shows a red dot on the audience slide.
+      // Positions travel as normalized (0-1) coordinates of the slide, so
+      // they stay correct at any window size, zoom or presentation mode.
+      // Marker: while ON, drag on the current slide to draw.  Strokes are
+      // stored per deck (FNV-1a of the file bytes) and per page in
+      // localStorage — they survive reloads and page turns — and are
+      // mirrored to the audience viewer as a screen-only SVG overlay.
+      // Undo rolls back the last stroke (or the last clear-all); the
+      // trash button clears every page.  Ctrl+Z undoes too.
+      const INK_PREFIX = "pc.ink.v1.";
+      const TOOLS_KEY = "pc.tools.v1";
+      const INK_COLOR = "rgba(230,30,30,0.9)";
+      const INK_WIDTH = 0.0045; // stroke width, fraction of slide width
+
+      let docKey = null; // identity of the picked PDF (ink storage key)
+      let ink = {}; // page -> [ {pts:[[nx,ny],...], color, width} ]
+      let inkHistory = []; // {type:"add",page} | {type:"clear",snapshot}
+      let laserOn = false;
+      let markerOn = false;
+      let drawing = null; // stroke in progress
+      let lastPt = null; // last appended point (distance throttle)
+      let slidePdfCanvas = null;
+      let inkCanvas = null;
+      let inkCtx = null;
+      let laserDot = null;
+
+      // FNV-1a over the file bytes: fast, stable per-deck storage key.
+      function fnv1a(bytes) {
+        let h = 0x811c9dc5;
+        for (let i = 0; i < bytes.length; i++) {
+          h ^= bytes[i];
+          h = Math.imul(h, 0x01000193);
+        }
+        return (h >>> 0).toString(16);
+      }
+
+      function loadTools() {
+        try {
+          const t = JSON.parse(localStorage.getItem(TOOLS_KEY));
+          if (t && typeof t === "object") {
+            laserOn = !!t.laser;
+            markerOn = !!t.marker;
+          }
+        } catch {}
+      }
+      function saveTools() {
+        try {
+          localStorage.setItem(
+            TOOLS_KEY,
+            JSON.stringify({ laser: laserOn, marker: markerOn }),
+          );
+        } catch {}
+      }
+      function loadInk() {
+        ink = {};
+        if (!docKey) return;
+        try {
+          const s = JSON.parse(localStorage.getItem(INK_PREFIX + docKey));
+          if (s && typeof s === "object") ink = s;
+        } catch {}
+      }
+      function saveInk() {
+        if (!docKey) return;
+        try {
+          localStorage.setItem(INK_PREFIX + docKey, JSON.stringify(ink));
+        } catch (e) {
+          console.warn("marker: could not save strokes", e);
+        }
+      }
+
+      // Wrap the freshly rendered current-slide canvas in a stage that
+      // also hosts the marker overlay canvas and the local laser dot.
+      // renderHalf() re-creates the canvas on every render, so this runs
+      // after each showPage(); listeners live on the pane (persistent).
+      function buildSlideStage() {
+        const pane = $("slidewrap");
+        const pdfCanvas = pane.querySelector("canvas");
+        if (!pdfCanvas) {
+          slidePdfCanvas = inkCanvas = inkCtx = laserDot = null;
+          return;
+        }
+        const stage = document.createElement("div");
+        stage.className = "slide-stage";
+        inkCanvas = document.createElement("canvas");
+        inkCanvas.className = "ink-overlay";
+        inkCanvas.width = pdfCanvas.width;
+        inkCanvas.height = pdfCanvas.height;
+        laserDot = document.createElement("div");
+        laserDot.className = "laser-dot";
+        pane.replaceChildren(stage);
+        stage.append(pdfCanvas, inkCanvas, laserDot);
+        slidePdfCanvas = pdfCanvas;
+        inkCtx = inkCanvas.getContext("2d");
+      }
+
+      // Normalized slide coordinates for a pointer event, accounting
+      // for the object-fit:contain letterboxing of the PDF canvas.
+      function normFromEvent(ev) {
+        if (!slidePdfCanvas) return null;
+        const r = slidePdfCanvas.getBoundingClientRect();
+        if (!r.width || !r.height) return null;
+        const bufW = slidePdfCanvas.width;
+        const bufH = slidePdfCanvas.height;
+        const scale = Math.min(r.width / bufW, r.height / bufH);
+        const dispW = bufW * scale;
+        const dispH = bufH * scale;
+        const offX = r.left + (r.width - dispW) / 2;
+        const offY = r.top + (r.height - dispH) / 2;
+        const nx = (ev.clientX - offX) / dispW;
+        const ny = (ev.clientY - offY) / dispH;
+        return { nx, ny, inside: nx >= 0 && nx <= 1 && ny >= 0 && ny <= 1 };
+      }
+
+      function drawStroke(ctx, s, W, H) {
+        const pts = s.pts;
+        if (!pts || !pts.length) return;
+        ctx.save();
+        ctx.strokeStyle = s.color || INK_COLOR;
+        ctx.lineWidth = Math.max(2, (s.width || INK_WIDTH) * W);
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        ctx.moveTo(pts[0][0] * W, pts[0][1] * H);
+        if (pts.length === 1) {
+          ctx.lineTo(pts[0][0] * W + 0.05, pts[0][1] * H);
+        } else {
+          for (let i = 1; i < pts.length; i++) {
+            ctx.lineTo(pts[i][0] * W, pts[i][1] * H);
+          }
+        }
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      function redrawInk() {
+        if (!inkCtx || !inkCanvas) return;
+        const W = inkCanvas.width;
+        const H = inkCanvas.height;
+        inkCtx.clearRect(0, 0, W, H);
+        for (const s of ink[page] || []) drawStroke(inkCtx, s, W, H);
+        if (drawing) drawStroke(inkCtx, drawing, W, H);
+      }
+
+      // ---- audience sync (pointer + strokes, rAF-throttled) ----------
+      let pointerFrame = null;
+      let pendingPointer = null;
+      function sendPointer(x, y, visible) {
+        pendingPointer = { x, y, visible };
+        if (pointerFrame !== null) return;
+        pointerFrame = requestAnimationFrame(() => {
+          pointerFrame = null;
+          if (audience && !audience.closed)
+            audience.postMessage({ type: "pointer", ...pendingPointer }, "*");
+        });
+      }
+      function sendTools() {
+        if (audience && !audience.closed)
+          audience.postMessage(
+            { type: "tools", laser: laserOn, marker: markerOn },
+            "*",
+          );
+      }
+      function pushStrokes(p) {
+        if (audience && !audience.closed)
+          audience.postMessage(
+            { type: "strokes", page: p, list: ink[p] || [] },
+            "*",
+          );
+      }
+      function pushInkReset() {
+        if (audience && !audience.closed)
+          audience.postMessage({ type: "strokesClearAll" }, "*");
+      }
+
+      function updateInkButtons() {
+        $("undoInk").disabled = inkHistory.length === 0;
+        $("clearInk").disabled = Object.keys(ink).length === 0;
+      }
+      function updateCursor() {
+        $("slidewrap").classList.toggle("marker-cursor", markerOn);
+      }
+
+      function setLaser(on) {
+        laserOn = on;
+        saveTools();
+        $("laserToggle").classList.toggle("active", laserOn);
+        if (!laserOn) {
+          sendPointer(0, 0, false);
+          if (laserDot) laserDot.style.display = "none";
+        }
+        sendTools();
+      }
+      function setMarker(on) {
+        markerOn = on;
+        saveTools();
+        $("markerToggle").classList.toggle("active", markerOn);
+        updateCursor();
+        sendTools();
+      }
+
+      function undoInk() {
+        const a = inkHistory.pop();
+        if (!a) {
+          updateInkButtons();
+          return;
+        }
+        if (a.type === "add") {
+          const list = ink[a.page] || [];
+          list.pop();
+          if (!list.length) delete ink[a.page];
+          saveInk();
+          pushStrokes(a.page);
+          if (a.page === page) redrawInk();
+        } else if (a.type === "clear") {
+          ink = a.snapshot;
+          saveInk();
+          pushInkReset();
+          pushStrokes(page);
+          redrawInk();
+        }
+        updateInkButtons();
+      }
+      function clearInk() {
+        if (!Object.keys(ink).length) return;
+        inkHistory.push({
+          type: "clear",
+          snapshot: JSON.parse(JSON.stringify(ink)),
+        });
+        if (inkHistory.length > 200) inkHistory.shift();
+        ink = {};
+        saveInk();
+        pushInkReset();
+        redrawInk();
+        updateInkButtons();
+      }
+
+      // ---- drawing / hovering on the current slide --------------------
+      const slidePane = $("slidewrap");
+      slidePane.addEventListener("pointerdown", (ev) => {
+        if (!markerOn || ev.button !== 0 || !inkCtx) return;
+        const n = normFromEvent(ev);
+        if (!n || !n.inside) return;
+        try {
+          slidePane.setPointerCapture(ev.pointerId);
+        } catch {}
+        drawing = { pts: [[n.nx, n.ny]], color: INK_COLOR, width: INK_WIDTH };
+        lastPt = [n.nx, n.ny];
+        if (laserDot) laserDot.style.display = "none";
+        redrawInk();
+      });
+      slidePane.addEventListener("pointermove", (ev) => {
+        const n = normFromEvent(ev);
+        if (!n) return;
+        if (drawing) {
+          const cx = Math.min(1, Math.max(0, n.nx));
+          const cy = Math.min(1, Math.max(0, n.ny));
+          const dx = cx - lastPt[0];
+          const dy = cy - lastPt[1];
+          if (dx * dx + dy * dy > 2.5e-6) {
+            drawing.pts.push([cx, cy]);
+            lastPt = [cx, cy];
+            redrawInk();
+          }
+          return;
+        }
+        if (laserOn) {
+          sendPointer(n.nx, n.ny, n.inside);
+          if (laserDot) {
+            if (n.inside) {
+              positionDot(n);
+              laserDot.style.display = "block";
+            } else {
+              laserDot.style.display = "none";
+            }
+          }
+        }
+      });
+      const endStroke = (ev) => {
+        if (!drawing) return;
+        try {
+          if (slidePane.hasPointerCapture && slidePane.hasPointerCapture(ev.pointerId))
+            slidePane.releasePointerCapture(ev.pointerId);
+        } catch {}
+        const s = drawing;
+        drawing = null;
+        (ink[page] ||= []).push(s);
+        inkHistory.push({ type: "add", page });
+        if (inkHistory.length > 200) inkHistory.shift();
+        saveInk();
+        pushStrokes(page);
+        redrawInk();
+        updateInkButtons();
+      };
+      slidePane.addEventListener("pointerup", endStroke);
+      slidePane.addEventListener("pointercancel", endStroke);
+      slidePane.addEventListener("pointerleave", () => {
+        if (laserOn) {
+          sendPointer(0, 0, false);
+          if (laserDot) laserDot.style.display = "none";
+        }
+      });
+      function positionDot(n) {
+        const r = slidePdfCanvas.getBoundingClientRect();
+        const bufW = slidePdfCanvas.width;
+        const bufH = slidePdfCanvas.height;
+        const scale = Math.min(r.width / bufW, r.height / bufH);
+        const dispW = bufW * scale;
+        const dispH = bufH * scale;
+        laserDot.style.left = (r.width - dispW) / 2 + n.nx * dispW + "px";
+        laserDot.style.top = (r.height - dispH) / 2 + n.ny * dispH + "px";
+      }
+
+      $("laserToggle").addEventListener("click", () => setLaser(!laserOn));
+      $("markerToggle").addEventListener("click", () => setMarker(!markerOn));
+      $("undoInk").addEventListener("click", undoInk);
+      $("clearInk").addEventListener("click", clearInk);
+      window.addEventListener("keydown", (ev) => {
+        if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "z") {
+          ev.preventDefault();
+          undoInk();
+        }
+      });
+      loadTools();
+      $("laserToggle").classList.toggle("active", laserOn);
+      $("markerToggle").classList.toggle("active", markerOn);
+      updateCursor();
+      updateInkButtons();
     </script>
   </body>
 </html>

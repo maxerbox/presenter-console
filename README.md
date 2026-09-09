@@ -19,6 +19,18 @@ get a two-window presenter setup:
   in **two resizable regions** (drag the separators — one vertical between
   notes and slides, one horizontal between current and next slide; double-
   click to reset), with an elapsed-time timer.
+- **Presenter tools** (buttons next to the timer):
+  - **⊙ Pointer** — a red laser dot follows your mouse over the current slide
+    in the console *or* the audience window, and shows in both. Positions are
+    normalized (0–1) slide coordinates, so they stay correct at any window
+    size, zoom or presentation mode.
+  - **✎ Marker** — draw freehand on the current slide; strokes appear on the
+    audience slide as a screen-only overlay. Strokes are stored per deck
+    (content-hashed) and per page in `localStorage`, so they survive console
+    reloads and page turns.
+  - **↩ Undo / 🗑 Trash** — undo the last stroke or clear-all (Ctrl+Z works
+    too); trash wipes every page's annotations. Undo history is per session.
+  - Divider sizes and tool toggles are remembered across sessions.
 
 ## Layout
 
@@ -78,6 +90,11 @@ remembered across sessions.
   subscribes `pagechanging` on its eventBus and `postMessage`s the page to the
   console; the console sends `goto` and the cropped deck bytes
   (`{type:"load", data}` → `PDFViewerApplication.open({data, filename})`).
+- Pointer and marker traffic travels over the same channel (`pointer`,
+  `tools`, `strokes`, `strokesClearAll` messages). The shim re-injects its
+  overlay (an SVG + a positioned dot) into the current page div whenever
+  pdf.js rebuilds it, and the console re-adopts the audience popup after a
+  console reload via a periodic `hello` heartbeat.
 - Page numbers are identical console↔audience (same underlying document), so
   sync is plain page numbers — no text mapping needed.
 - Re-picking a PDF while the audience window is open pushes the new cropped deck
