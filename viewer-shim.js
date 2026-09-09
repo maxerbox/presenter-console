@@ -127,14 +127,20 @@
     // <tspan> per line: x at the anchor, y stepping by 1.35em like the
     // console's canvas renderer (LINE_FACTOR 1.35, same as pdf.js)
     lines.forEach((ln, i) => {
-      const ts = document.createElementNS("http://www.w3.org/2000/svg", "tspan");
+      const ts = document.createElementNS(
+        "http://www.w3.org/2000/svg",
+        "tspan",
+      );
       ts.setAttribute("x", t.nx * 1000);
       ts.setAttribute("y", (t.ny + i * (t.size || 0.045) * 1.35) * 1000);
       ts.textContent = ln;
       text.appendChild(ts);
     });
     text.setAttribute("fill", t.color || "rgba(230,30,30,0.9)");
-    text.setAttribute("font-family", "Helvetica Neue, Helvetica, Arial, sans-serif");
+    text.setAttribute(
+      "font-family",
+      "Helvetica Neue, Helvetica, Arial, sans-serif",
+    );
     text.setAttribute("font-size", size);
     text.setAttribute("dominant-baseline", "auto"); // default: baseline at y
     text.style.userSelect = "none";
@@ -340,6 +346,19 @@
     // overlay re-injects, zoom re-renders) would flip it back to
     // frame 0, i.e. reset the animation the presenter just showed.
     const pageOpenDispatched = new Set();
+    // Pages where the PageOpen JS's own display writes have ALREADY
+    // LANDED since the last PageOpen dispatch.  The dispatch itself
+    // is async (worker getJSActions round-trip, then the JS runs and
+    // each .display= write lands as its own updatefromsandbox task) —
+    // so for the page being turned TO, the layer can attach AFTER
+    // the dispatch but BEFORE the writes land (pagerendered fires
+    // #dispatchPageOpen).  In that window the page is dispatched but
+    // still pristine: the flip+hold must run there too, or the
+    // poster paints for the frames between attach and the JS's
+    // seekFrame(0) write.  After the first write lands the page is
+    // the JS's business — the finished-one-shot rest state must not
+    // be flipped (see pageOpenDispatched above).
+    const pageWritesLanded = new Set();
 
     // --- pending display writes for detached elements (part 2) --------
     const pendingDisplay = new Map(); // elementId -> visible bool
@@ -411,6 +430,8 @@
     // the flip via the same observer.
     let animMap = null; // [{page, frames:[{k,id}], firstId, posterId, autoplay}]
     let animMapPromise = null;
+    // frame element id -> {anim, isPoster, isFirst} (for hold releases)
+    const frameIdToAnim = new Map();
     const ensureAnimMap = () => {
       const doc = app.pdfDocument;
       if (animMapPromise || !doc) return;
@@ -468,6 +489,16 @@
         }
         if (app.pdfDocument === doc) {
           animMap = map;
+          frameIdToAnim.clear();
+          for (const anim of map) {
+            for (const fr of anim.frames) {
+              frameIdToAnim.set(fr.id, {
+                anim,
+                isPoster: fr.id === anim.posterId,
+                isFirst: fr.id === anim.firstId,
+              });
+            }
+          }
           // the current page's layer may have attached while the
           // field-object round-trip was in flight — flip it now
           suppressPosterFlash();
@@ -480,15 +511,94 @@
       // shim's rule: fresh state always wins over remembered state)
       pendingDisplay.delete(id);
     };
+    // Part 3b — the PageOpen JS itself re-seeks to the poster on the
+    // FIRST visit (animate's init block ends with aN_seekFrame(last)
+    // before the play dispatch), and each display write of that seek
+    // lands as its own updatefromsandbox task — so the browser can
+    // paint the poster BETWEEN the JS's own writes (init seek to the
+    // poster, then stopFirst's seek back to frame 0), no matter what
+    // the section flip above did.  The audience sees: frame-0 flash,
+    // poster flash, blank, then playback.  Fix: while a not-yet-
+    // dispatched autoplay page sits in its pristine poster state,
+    // keep the whole annotation layer invisible (screen-only inline
+    // style) — the static slide beneath the widgets shows the
+    // intended start state — and release the hold when the JS's own
+    // first playback write lands (poster hidden / frame 0 shown), on
+    // PageClose, or via a safety timeout.
+    const heldAnims = new Map(); // page -> {timer}
+    const layerForPage = (page) =>
+      document
+        .querySelector('[data-page-number="' + page + '"]')
+        ?.querySelector(".annotationLayer") || null;
+    const releaseAnimLayer = (page) => {
+      const entry = heldAnims.get(page);
+      if (!entry) return;
+      clearTimeout(entry.timer);
+      heldAnims.delete(page);
+      const layer = layerForPage(page);
+      if (layer) layer.style.visibility = "";
+    };
+    const holdAnimLayer = (anim) => {
+      if (!heldAnims.has(anim.page)) {
+        // safety net: never hold a layer hostage to a broken script
+        const timer = setTimeout(() => releaseAnimLayer(anim.page), 3500);
+        heldAnims.set(anim.page, { timer });
+      }
+      // (re)apply: the layer element may be new (rebuild) while the
+      // hold is still logically active
+      const layer = layerForPage(anim.page);
+      if (layer) layer.style.visibility = "hidden";
+    };
+    const reapplyHolds = () => {
+      for (const page of heldAnims.keys()) {
+        const layer = layerForPage(page);
+        if (layer) layer.style.visibility = "hidden";
+      }
+    };
+    const maybeReleaseHold = (elementId, visible) => {
+      const fr = frameIdToAnim.get(elementId);
+      if (!fr) return;
+      // The JS's TRANSITION write: poster hidden (+ frame 0 shown
+      // next) on playFwd; poster hidden while stepping away from it
+      // on playBwd — the JS has left the poster state and playback
+      // owns the screen from here.  This write also marks the end of
+      // the attach→first-write flip window (pageWritesLanded): later
+      // DOM mutations must not re-flip a finished one-shot.
+      if (fr.isPoster && !visible) {
+        pageWritesLanded.add(fr.anim.page);
+        releaseAnimLayer(fr.anim.page);
+        return;
+      }
+      if (fr.isFirst && visible) {
+        pageWritesLanded.add(fr.anim.page);
+        releaseAnimLayer(fr.anim.page);
+      }
+    };
     const suppressPosterFlash = () => {
       if (!animMap || !animMap.length) return;
+      reapplyHolds();
       for (const anim of animMap) {
-        if (!anim.autoplay) continue;
+        if (!anim.autoplay) {
+          continue;
+        }
         // Only pre-empt pages whose PageOpen JS has not been
         // dispatched yet (the flash window is layer-attach -> JS).
         // After that the flip would fight the JS: a finished one-shot
         // rests in the pristine poster state and must stay there.
-        if (pageOpenDispatched.has(anim.page)) continue;
+        // Only pre-empt pages whose animation state is not yet owned
+        // by the PageOpen JS: either the PageOpen has not been
+        // dispatched at all (pre-rendered neighbor page attaching),
+        // or it was dispatched but its own display writes have not
+        // landed yet (the page being turned TO — attach happens
+        // between dispatch and writes).  Once writes have landed the
+        // flip would fight the JS: a finished one-shot rests in the
+        // pristine poster state and must stay there.
+        if (
+          pageOpenDispatched.has(anim.page) &&
+          pageWritesLanded.has(anim.page)
+        ) {
+          continue;
+        }
         const pageDiv = document.querySelector(
           '[data-page-number="' + anim.page + '"]',
         );
@@ -521,6 +631,9 @@
         // display change (playFwd -> stopFirst -> seekFrame(0))
         applyAnimDisplay(posterSection, anim.posterId, false);
         applyAnimDisplay(firstSection, anim.firstId, true);
+        // and hold the whole layer until the JS's own writes take
+        // over (part 3b above)
+        holdAnimLayer(anim);
       }
     };
 
@@ -540,6 +653,8 @@
               // intended visibility for when the layer re-attaches
               pendingDisplay.set(elementId, value.display % 2 === 0);
             }
+            // layer-hold release check (raw-path visibility)
+            maybeReleaseHold(elementId, value.display % 2 === 0);
           } else if (
             "noView" in value &&
             document.querySelector(`[data-element-id="${elementId}"]`)
@@ -547,6 +662,8 @@
             // element-path display write (lands inline): invalidate
             // any pending entry so fresh state always wins
             pendingDisplay.delete(elementId);
+            // layer-hold release check (element-path visibility)
+            maybeReleaseHold(elementId, !value.noView);
           }
         }
         return origSetValue(elementId, value);
@@ -575,6 +692,9 @@
             }
             sandboxOpenPage = detail.pageNumber;
             pageOpenDispatched.add(detail.pageNumber);
+            // a fresh accepted visit starts with no landed writes:
+            // the flip window (attach → first write) is open again
+            pageWritesLanded.delete(detail.pageNumber);
           } else if (detail.name === "PageClose") {
             if (
               detail.pageNumber !== sandboxOpenPage ||
@@ -587,6 +707,9 @@
             }
             sandboxOpenPage = null;
             pageOpenDispatched.delete(detail.pageNumber);
+            // a held layer on a page we are leaving is pointless —
+            // release it so nothing dangles
+            releaseAnimLayer(detail.pageNumber);
           }
         }
         return origDispatch(detail);
@@ -601,8 +724,12 @@
           logicalPage = null;
           pendingDisplay.clear();
           pageOpenDispatched.clear();
+          pageWritesLanded.clear();
           animMap = null;
           animMapPromise = null;
+          for (const entry of heldAnims.values()) clearTimeout(entry.timer);
+          heldAnims.clear();
+          frameIdToAnim.clear();
           const r = origCreateSandbox(...sargs);
           hookStorage(app.pdfDocument);
           ensureAnimMap();
