@@ -329,9 +329,9 @@
           Pick your <b>presentation PDF</b> — the double-width
           slide&nbsp;|&nbsp;notes build (from
           <code>..._presentation_notes.tex</code>). The console shows the notes
-          on the left, the current slide above the next slide on the right
-          (drag the separators to resize; double-click a separator to reset);
-          the audience window receives a cropped slide-only copy — animations
+          on the left, the current slide above the next slide on the right (drag
+          the separators to resize; double-click a separator to reset); the
+          audience window receives a cropped slide-only copy — animations
           included.
         </p>
         <button id="pickPdf">Browse PDF…</button>
@@ -868,6 +868,26 @@
         if (audience && !audience.closed)
           audience.postMessage({ type: "strokesClearAll" }, "*");
       }
+      // Live marker feedback: mirror the in-progress stroke to the
+      // audience WHILE it is being drawn (pdf.js' own ink editor does
+      // the same).  rAF-throttled — pointermove fires far more often
+      // than the screen paints.
+      let liveFrame = null;
+      function sendLiveStroke() {
+        if (liveFrame !== null) return;
+        liveFrame = requestAnimationFrame(() => {
+          liveFrame = null;
+          if (audience && !audience.closed)
+            audience.postMessage(
+              {
+                type: "strokeLive",
+                page,
+                stroke: drawing ? { pts: drawing.pts, color: drawing.color, width: drawing.width } : null,
+              },
+              "*",
+            );
+        });
+      }
 
       function updateInkButtons() {
         $("undoInk").disabled = inkHistory.length === 0;
@@ -944,6 +964,7 @@
         lastPt = [n.nx, n.ny];
         if (laserDot) laserDot.style.display = "none";
         redrawInk();
+        sendLiveStroke(); // audience sees the ink immediately
       });
       slidePane.addEventListener("pointermove", (ev) => {
         const n = normFromEvent(ev);
@@ -957,6 +978,7 @@
             drawing.pts.push([cx, cy]);
             lastPt = [cx, cy];
             redrawInk();
+            sendLiveStroke();
           }
           return;
         }
@@ -975,7 +997,10 @@
       const endStroke = (ev) => {
         if (!drawing) return;
         try {
-          if (slidePane.hasPointerCapture && slidePane.hasPointerCapture(ev.pointerId))
+          if (
+            slidePane.hasPointerCapture &&
+            slidePane.hasPointerCapture(ev.pointerId)
+          )
             slidePane.releasePointerCapture(ev.pointerId);
         } catch {}
         const s = drawing;
@@ -984,6 +1009,7 @@
         inkHistory.push({ type: "add", page });
         if (inkHistory.length > 200) inkHistory.shift();
         saveInk();
+        sendLiveStroke(); // end-of-stroke: null clears the live path
         pushStrokes(page);
         redrawInk();
         updateInkButtons();

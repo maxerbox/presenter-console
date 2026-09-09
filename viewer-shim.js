@@ -13,6 +13,7 @@
 //   ← {type:"pointer", x,y,visible}     red pointer position (normalized)
 //   ← {type:"tools", laser, marker}     pointer/marker toggle state
 //   ← {type:"strokes", page, list}      marker strokes for a page
+//   ← {type:"strokeLive", page, stroke} in-progress marker stroke (live)
 //   ← {type:"strokesClearAll"}          every marker stroke deleted
 (function () {
   "use strict";
@@ -35,6 +36,8 @@
     markerOn: false,
     pointer: { x: 0.5, y: 0.5, visible: false },
     strokes: new Map(), // page -> [ {pts, color, width} ]
+    liveStroke: null, // {page, stroke} while the console is drawing
+    livePath: null, // SVG path element for the in-progress stroke
     dot: null,
     svg: null,
   };
@@ -61,10 +64,7 @@
     toolsOverlay.pageDiv = pageDiv;
     const dot = document.createElement("div");
     dot.className = "pc-laser-dot";
-    const svg = document.createElementNS(
-      "http://www.w3.org/2000/svg",
-      "svg"
-    );
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("class", "pc-ink-svg");
     svg.setAttribute("preserveAspectRatio", "none");
     svg.setAttribute("viewBox", "0 0 1000 1000");
@@ -87,29 +87,71 @@
     dot.style.display = "block";
   }
 
+  function strokePathD(s) {
+    let d = `M ${s.pts[0][0] * 1000} ${s.pts[0][1] * 1000}`;
+    if (s.pts.length === 1) {
+      // single-point stroke (a tap): a move-only path renders nothing
+      // — emit a tiny segment so the round linecap shows a dot, same
+      // as the console canvas's drawStroke single-point handling
+      d += ` L ${s.pts[0][0] * 1000 + 0.5} ${s.pts[0][1] * 1000}`;
+      return d;
+    }
+    for (let i = 1; i < s.pts.length; i++) {
+      d += ` L ${s.pts[i][0] * 1000} ${s.pts[i][1] * 1000}`;
+    }
+    return d;
+  }
+
+  function appendStrokePath(svg, s) {
+    if (!s.pts || !s.pts.length) return;
+    const path = document.createElementNS(
+      "http://www.w3.org/2000/svg",
+      "path",
+    );
+    path.setAttribute("d", strokePathD(s));
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", s.color || "rgba(230,30,30,0.9)");
+    path.setAttribute("stroke-width", (s.width || 0.0045) * 1000);
+    path.setAttribute("stroke-linecap", "round");
+    path.setAttribute("stroke-linejoin", "round");
+    path.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.appendChild(path);
+    return path;
+  }
+
   function renderStrokes() {
     const svg = toolsOverlay.svg;
     if (!svg) return;
     while (svg.firstChild) svg.removeChild(svg.firstChild);
-    const list = toolsOverlay.strokes.get(currentPageNumber()) || [];
-    for (const s of list) {
-      if (!s.pts || !s.pts.length) continue;
-      const path = document.createElementNS(
-        "http://www.w3.org/2000/svg",
-        "path"
-      );
-      let d = `M ${s.pts[0][0] * 1000} ${s.pts[0][1] * 1000}`;
-      for (let i = 1; i < s.pts.length; i++) {
-        d += ` L ${s.pts[i][0] * 1000} ${s.pts[i][1] * 1000}`;
-      }
-      path.setAttribute("d", d);
-      path.setAttribute("fill", "none");
-      path.setAttribute("stroke", s.color || "rgba(230,30,30,0.9)");
-      path.setAttribute("stroke-width", (s.width || 0.0045) * 1000);
-      path.setAttribute("stroke-linecap", "round");
-      path.setAttribute("stroke-linejoin", "round");
-      path.setAttribute("vector-effect", "non-scaling-stroke");
-      svg.appendChild(path);
+    toolsOverlay.livePath = null;
+    const cur = currentPageNumber();
+    for (const s of toolsOverlay.strokes.get(cur) || []) {
+      appendStrokePath(svg, s);
+    }
+    // in-progress stroke from the console: rendered on top of the
+    // stored list so the audience sees the ink WHILE it is drawn
+    // (same live feedback as pdf.js' own pencil/ink editor)
+    const live = toolsOverlay.liveStroke;
+    if (live && live.page === cur) {
+      toolsOverlay.livePath = appendStrokePath(svg, live.stroke);
+    }
+  }
+
+  // Update ONLY the in-progress stroke's path (cheap: one attribute
+  // write, no list rebuild) — called on every live update from the
+  // console while the presenter is drawing.
+  function updateLiveStroke() {
+    const live = toolsOverlay.liveStroke;
+    const svg = toolsOverlay.svg;
+    if (!live || !svg) return;
+    const cur = currentPageNumber();
+    if (live.page !== cur) return;
+    const s = live.stroke;
+    if (!s.pts || !s.pts.length) return;
+    if (toolsOverlay.livePath && toolsOverlay.livePath.isConnected) {
+      toolsOverlay.livePath.setAttribute("d", strokePathD(s));
+    } else {
+      renderStrokes(); // overlay was re-injected (zoom/PM) — rebuild
     }
   }
 
@@ -266,6 +308,15 @@
 
     // --- sandbox open/close state (part 1) -----------------------------
     let sandboxOpenPage = null;
+    // Pages whose PageOpen was dispatched since their last PageClose.
+    // Gate for suppressPosterFlash: once the PageOpen JS has been
+    // dispatched for a page, its animation state is the JS's business.
+    // A finished ONE-SHOT animation (autoplay, no loop, poster=last)
+    // rests in exactly the "pristine poster" state the flip looks for
+    // — without this gate any later DOM mutation (marker strokes,
+    // overlay re-injects, zoom re-renders) would flip it back to
+    // frame 0, i.e. reset the animation the presenter just showed.
+    const pageOpenDispatched = new Set();
 
     // --- pending display writes for detached elements (part 2) --------
     const pendingDisplay = new Map(); // elementId -> visible bool
@@ -381,7 +432,7 @@
             const po = main.actions?.get?.("PageOpen");
             const js = Array.isArray(po) ? po.join("\n") : "";
             autoplay = js.endsWith(
-              "_playsRight){a" + n + "_playFwd();}else{a" + n + "_playBwd();}"
+              "_playsRight){a" + n + "_playFwd();}else{a" + n + "_playBwd();}",
             );
           } catch (e) {}
           map.push({
@@ -410,8 +461,13 @@
       if (!animMap || !animMap.length) return;
       for (const anim of animMap) {
         if (!anim.autoplay) continue;
+        // Only pre-empt pages whose PageOpen JS has not been
+        // dispatched yet (the flash window is layer-attach -> JS).
+        // After that the flip would fight the JS: a finished one-shot
+        // rests in the pristine poster state and must stay there.
+        if (pageOpenDispatched.has(anim.page)) continue;
         const pageDiv = document.querySelector(
-          '[data-page-number="' + anim.page + '"]'
+          '[data-page-number="' + anim.page + '"]',
         );
         const layer = pageDiv?.querySelector(".annotationLayer");
         if (!layer) continue;
@@ -422,7 +478,7 @@
           complete = true;
         for (const fr of anim.frames) {
           const sec = layer.querySelector(
-            '[data-annotation-id="' + fr.id + '"]'
+            '[data-annotation-id="' + fr.id + '"]',
           );
           if (!sec) {
             complete = false;
@@ -495,6 +551,7 @@
               // interval; the zombie runs it off-screen
             }
             sandboxOpenPage = detail.pageNumber;
+            pageOpenDispatched.add(detail.pageNumber);
           } else if (detail.name === "PageClose") {
             if (
               detail.pageNumber !== sandboxOpenPage ||
@@ -506,6 +563,7 @@
               // autoplay and re-poster it)
             }
             sandboxOpenPage = null;
+            pageOpenDispatched.delete(detail.pageNumber);
           }
         }
         return origDispatch(detail);
@@ -519,6 +577,7 @@
           sandboxOpenPage = null;
           logicalPage = null;
           pendingDisplay.clear();
+          pageOpenDispatched.clear();
           animMap = null;
           animMapPromise = null;
           const r = origCreateSandbox(...sargs);
@@ -561,6 +620,7 @@
       // New deck: drop any presenter-tools state tied to the old one.
       removeToolsOverlay();
       toolsOverlay.strokes.clear();
+      toolsOverlay.liveStroke = null;
       toolsOverlay.pointer = { x: 0, y: 0, visible: false };
       // Push the picked deck bytes into the official viewer.  Copy the
       // buffer: pdf.js transfers/detaches the ArrayBuffer it renders.
@@ -581,11 +641,24 @@
       toolsOverlay.laserOn = !!d.laser;
       toolsOverlay.markerOn = !!d.marker;
       applyPointer();
+    } else if (d.type === "strokeLive") {
+      // in-progress stroke from the console: shown while drawing.
+      // d.stroke === null signals end-of-stroke.
+      toolsOverlay.liveStroke = d.stroke
+        ? { page: d.page, stroke: d.stroke }
+        : null;
+      if (d.stroke) {
+        if (d.page === currentPageNumber()) updateLiveStroke();
+      } else {
+        toolsOverlay.livePath = null;
+      }
     } else if (d.type === "strokes") {
       toolsOverlay.strokes.set(d.page, d.list || []);
+      toolsOverlay.liveStroke = null; // finalized list supersedes it
       if (d.page === currentPageNumber()) renderStrokes();
     } else if (d.type === "strokesClearAll") {
       toolsOverlay.strokes.clear();
+      toolsOverlay.liveStroke = null;
       renderStrokes();
     }
   });
