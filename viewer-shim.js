@@ -35,11 +35,13 @@
     laserOn: false,
     markerOn: false,
     pointer: { x: 0.5, y: 0.5, visible: false },
-    strokes: new Map(), // page -> [ {pts, color, width} ]
+    strokes: new Map(), // page -> [ {pts, color, width} | {kind:"text",…} ]
     liveStroke: null, // {page, stroke} while the console is drawing
     livePath: null, // SVG path element for the in-progress stroke
+    liveText: null, // {page, text} while the console is typing
     dot: null,
     svg: null,
+    vbH: 562.5, // viewBox height: 1000 * pageH/pageW (aspect-correct)
   };
 
   function removeToolsOverlay() {
@@ -48,6 +50,47 @@
     toolsOverlay.dot = null;
     toolsOverlay.svg = null;
     toolsOverlay.pageDiv = null;
+  }
+
+  function applyPointer() {
+    const dot = toolsOverlay.dot;
+    if (!dot) return;
+    if (!toolsOverlay.laserOn || !toolsOverlay.pointer.visible) {
+      dot.style.display = "none";
+      return;
+    }
+    dot.style.left = toolsOverlay.pointer.x * 100 + "%";
+    dot.style.top = toolsOverlay.pointer.y * 100 + "%";
+    dot.style.display = "block";
+  }
+
+  // Aspect-correct viewBox height for the ink SVG.  The overlay SVG
+  // spans the page div with preserveAspectRatio="none", so a SQUARE
+  // viewBox (0 0 1000 1000) stretches glyphs horizontally on a 16:9
+  // slide (x scales ~1.78x more than y — strokes still land correctly
+  // because their points are normalized per-axis, but TEXT is visibly
+  // distorted).  Making the viewBox height match the page aspect
+  // (1000 * H/W) restores a uniform scale for everything, text
+  // included; stroke points are normalized, so they simply multiply
+  // the per-axis extents (x by 1000, y by vbH).
+  function refreshVbH() {
+    const app = toolsOverlay.app || window.PDFViewerApplication;
+    let vbH = 0;
+    try {
+      const pv = app?.pdfViewer?.getPageView?.(currentPageNumber() - 1);
+      const vp = pv?.viewport;
+      if (vp && vp.width > 0 && vp.height > 0)
+        vbH = (1000 * vp.height) / vp.width;
+    } catch {}
+    if (!vbH) {
+      // fallback: the rendered page canvas' buffer aspect (scale-
+      // independent), else assume 16:9
+      const c = currentPageDiv()?.querySelector("canvas");
+      if (c && c.width > 0 && c.height > 0) vbH = (1000 * c.height) / c.width;
+      else vbH = 562.5;
+    }
+    toolsOverlay.vbH = vbH;
+    toolsOverlay.svg?.setAttribute("viewBox", `0 0 1000 ${vbH}`);
   }
 
   function ensureToolsOverlay(pageDiv) {
@@ -67,28 +110,18 @@
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("class", "pc-ink-svg");
     svg.setAttribute("preserveAspectRatio", "none");
-    svg.setAttribute("viewBox", "0 0 1000 1000");
+    svg.setAttribute("viewBox", "0 0 1000 " + toolsOverlay.vbH);
     toolsOverlay.dot = dot;
     toolsOverlay.svg = svg;
     pageDiv.append(dot, svg);
+    refreshVbH(); // true aspect from the page view, then re-render
     applyPointer();
     renderStrokes();
   }
 
-  function applyPointer() {
-    const dot = toolsOverlay.dot;
-    if (!dot) return;
-    if (!toolsOverlay.laserOn || !toolsOverlay.pointer.visible) {
-      dot.style.display = "none";
-      return;
-    }
-    dot.style.left = toolsOverlay.pointer.x * 100 + "%";
-    dot.style.top = toolsOverlay.pointer.y * 100 + "%";
-    dot.style.display = "block";
-  }
-
   function strokePathD(s) {
-    let d = `M ${s.pts[0][0] * 1000} ${s.pts[0][1] * 1000}`;
+    const vbH = toolsOverlay.vbH;
+    let d = `M ${s.pts[0][0] * 1000} ${s.pts[0][1] * vbH}`;
     if (s.pts.length === 1) {
       // single-point stroke (a tap): a move-only path renders nothing
       // — emit a tiny segment so the round linecap shows a dot, same
@@ -118,11 +151,13 @@
 
   // Text annotation (pdf.js FreeText-style): (nx, ny) is the baseline
   // start of the first line, size a fraction of the slide height.
-  // Rendered in the viewBox-1000 space so it scales with the slide.
+  // Rendered in the viewBox space (0 0 1000 vbH) so it scales with the
+  // slide WITHOUT distortion — vbH carries the page aspect.
   function appendText(svg, t) {
     if (!t.txt) return;
     const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-    const size = (t.size || 0.045) * 1000;
+    const vbH = toolsOverlay.vbH;
+    const size = (t.size || 0.045) * vbH;
     const lines = t.txt.split("\n");
     // <tspan> per line: x at the anchor, y stepping by 1.35em like the
     // console's canvas renderer (LINE_FACTOR 1.35, same as pdf.js)
@@ -132,7 +167,7 @@
         "tspan",
       );
       ts.setAttribute("x", t.nx * 1000);
-      ts.setAttribute("y", (t.ny + i * (t.size || 0.045) * 1.35) * 1000);
+      ts.setAttribute("y", (t.ny + i * (t.size || 0.045) * 1.35) * vbH);
       ts.textContent = ln;
       text.appendChild(ts);
     });
@@ -151,6 +186,7 @@
   function renderStrokes() {
     const svg = toolsOverlay.svg;
     if (!svg) return;
+    refreshVbH(); // aspect may be unknown until the first render
     while (svg.firstChild) svg.removeChild(svg.firstChild);
     toolsOverlay.livePath = null;
     const cur = currentPageNumber();
@@ -165,6 +201,10 @@
     if (live && live.page === cur) {
       toolsOverlay.livePath = appendStrokePath(svg, live.stroke);
     }
+    // in-progress text draft from the console: same live feedback —
+    // the audience sees characters as they are typed
+    const lt = toolsOverlay.liveText;
+    if (lt && lt.page === cur) appendText(svg, lt.text);
   }
   // Update ONLY the in-progress stroke's path (cheap: one attribute
   // write, no list rebuild) — called on every live update from the
@@ -777,6 +817,7 @@
       removeToolsOverlay();
       toolsOverlay.strokes.clear();
       toolsOverlay.liveStroke = null;
+      toolsOverlay.liveText = null;
       toolsOverlay.pointer = { x: 0, y: 0, visible: false };
       // Push the picked deck bytes into the official viewer.  Copy the
       // buffer: pdf.js transfers/detaches the ArrayBuffer it renders.
@@ -838,13 +879,21 @@
       } else {
         toolsOverlay.livePath = null;
       }
+    } else if (d.type === "textLive") {
+      // in-progress text draft from the console: shown while typing.
+      // d.text === null signals end-of-editing (commit or cancel);
+      // the finalized list then arrives via "strokes".
+      toolsOverlay.liveText = d.text ? { page: d.page, text: d.text } : null;
+      renderStrokes();
     } else if (d.type === "strokes") {
       toolsOverlay.strokes.set(d.page, d.list || []);
       toolsOverlay.liveStroke = null; // finalized list supersedes it
+      toolsOverlay.liveText = null; // …and any live text draft
       if (d.page === currentPageNumber()) renderStrokes();
     } else if (d.type === "strokesClearAll") {
       toolsOverlay.strokes.clear();
       toolsOverlay.liveStroke = null;
+      toolsOverlay.liveText = null;
       renderStrokes();
     }
   });

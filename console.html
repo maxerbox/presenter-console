@@ -752,6 +752,7 @@
 
       async function showPage(n) {
         $("pageinfo").textContent = total ? `${n} / ${total}` : `${n}`;
+        commitTextEditor(); // finish typing before the stage is rebuilt
         if (!notesPdf) return;
         try {
           await Promise.all([
@@ -781,7 +782,12 @@
         rerender();
       });
 
-      // ---- presenter tools: red pointer + marker (persisted per deck) ----
+      // ---- presenter tools: pointer + marker + text (persisted) ----
+      // The four tools are INDEPENDENT toggles: the pointer may hover
+      // along while the marker draws or text is typed (the audience dot
+      // keeps following the pen), and switching one on never switches
+      // the others off.  On a click, precedence is text > eraser >
+      // marker (see the pointerdown handler).
       // Pointer: while ON, hovering the current slide here (or the
       // audience window itself) shows a red dot on the audience slide.
       // Positions travel as normalized (0-1) coordinates of the slide, so
@@ -954,7 +960,11 @@
         ctx.textBaseline = "alphabetic";
         const lines = t.txt.split("\n");
         for (let i = 0; i < lines.length; i++) {
-          ctx.fillText(lines[i], t.nx * W, (t.ny + i * (t.size || defaultFontSize) * 1.35) * H);
+          ctx.fillText(
+            lines[i],
+            t.nx * W,
+            (t.ny + i * (t.size || defaultFontSize) * 1.35) * H,
+          );
         }
         ctx.restore();
       }
@@ -989,7 +999,8 @@
         // bbox in normalized coords: x from nx, y from baseline up
         const x0 = t.nx - r;
         const x1 = t.nx + bw + r;
-        const y0 = t.ny - lines.length * ((t.size || defaultFontSize) * 1.35) - r;
+        const y0 =
+          t.ny - lines.length * ((t.size || defaultFontSize) * 1.35) - r;
         const y1 = t.ny + r;
         return x >= x0 && x <= x1 && y >= y0 && y <= y1;
       }
@@ -1075,6 +1086,32 @@
         });
       }
 
+      // Live text feedback: mirror the in-progress text draft to the
+      // audience WHILE it is typed — same idea as sendLiveStroke, so
+      // the audience sees characters as they appear (not only after
+      // the editor commits).
+      let textFrame = null;
+      let pendingTextMsg = null;
+      function sendLiveText() {
+        if (!textEditing) return;
+        pendingTextMsg = {
+          type: "textLive",
+          page: textEditing.page,
+          text: { ...textEditing.draft },
+        };
+        if (textFrame !== null) return;
+        textFrame = requestAnimationFrame(() => {
+          textFrame = null;
+          if (audience && !audience.closed && pendingTextMsg)
+            audience.postMessage(pendingTextMsg, "*");
+        });
+      }
+      function sendLiveTextEnd() {
+        pendingTextMsg = null;
+        if (audience && !audience.closed)
+          audience.postMessage({ type: "textLive", text: null }, "*");
+      }
+
       function updateInkButtons() {
         $("undoInk").disabled = inkHistory.length === 0;
         $("clearInk").disabled = Object.keys(ink).length === 0;
@@ -1087,11 +1124,6 @@
 
       function setMarker(on) {
         markerOn = on;
-        if (on) {
-          laserOn = false;
-          textOn = false;
-          eraserOn = false;
-        }
         saveTools();
         syncToolButtons();
         updateCursor();
@@ -1099,11 +1131,6 @@
       }
       function setText(on) {
         textOn = on;
-        if (on) {
-          laserOn = false;
-          markerOn = false;
-          eraserOn = false;
-        }
         saveTools();
         syncToolButtons();
         updateCursor();
@@ -1111,11 +1138,6 @@
       }
       function setEraser(on) {
         eraserOn = on;
-        if (on) {
-          laserOn = false;
-          markerOn = false;
-          textOn = false;
-        }
         if (!on && eraserRing) eraserRing.style.display = "none";
         saveTools();
         syncToolButtons();
@@ -1124,11 +1146,6 @@
       }
       function setLaser(on) {
         laserOn = on;
-        if (on) {
-          markerOn = false;
-          textOn = false;
-          eraserOn = false;
-        }
         if (!laserOn) {
           sendPointer(0, 0, false);
           if (laserDot) laserDot.style.display = "none";
@@ -1153,7 +1170,11 @@
             best = opt;
             break;
           }
-          if (!best || Math.abs(v - defaultFontSize) < Math.abs(parseFloat(best.value) - defaultFontSize))
+          if (
+            !best ||
+            Math.abs(v - defaultFontSize) <
+              Math.abs(parseFloat(best.value) - defaultFontSize)
+          )
             best = opt;
         }
         if (best) sel.value = best.value;
@@ -1219,6 +1240,9 @@
         // synchronously, and the blur handler must see nothing to do
         textEditor = null;
         textEditing = null;
+        // stop mirroring the draft; the finalized stroke list (with or
+        // without the text) takes over on the audience side
+        sendLiveTextEnd();
         div.remove();
         if (txt) {
           const item = { kind: "text", ...draft, txt };
@@ -1262,7 +1286,10 @@
         div.style.color = INK_COLOR;
         stage.appendChild(div);
         textEditor = div;
-        textEditing = { page, draft: { nx, ny, size: defaultFontSize, txt: "" } };
+        textEditing = {
+          page,
+          draft: { nx, ny, size: defaultFontSize, txt: "" },
+        };
         div.addEventListener("keydown", (ev) => {
           ev.stopPropagation();
           if (ev.key === "Escape" || (ev.ctrlKey && ev.key === "Enter")) {
@@ -1274,7 +1301,10 @@
         // nulls the refs before .remove() so this can't double-fire
         div.addEventListener("blur", () => commitTextEditor());
         div.addEventListener("input", () => {
-          if (textEditing) textEditing.draft.txt = div.innerText;
+          if (textEditing) {
+            textEditing.draft.txt = div.innerText;
+            sendLiveText(); // audience sees the draft while typing
+          }
         });
         // Focus synchronously: the div is already in the DOM, so the
         // caret is ready before the user's first keystroke can land
@@ -1314,6 +1344,9 @@
 
       slidePane.addEventListener("pointerdown", (ev) => {
         if (ev.button !== 0) return;
+        // clicks INSIDE the open text editor (caret moves, selection)
+        // must not commit-and-restart it somewhere else
+        if (ev.target.closest?.(".text-editor")) return;
         const n = normFromEvent(ev);
         if (!n || !n.inside) return;
         if (textOn) {
@@ -1334,9 +1367,13 @@
         try {
           slidePane.setPointerCapture(ev.pointerId);
         } catch {}
-        drawing = { kind: "stroke", pts: [[n.nx, n.ny]], color: INK_COLOR, width: INK_WIDTH };
+        drawing = {
+          kind: "stroke",
+          pts: [[n.nx, n.ny]],
+          color: INK_COLOR,
+          width: INK_WIDTH,
+        };
         lastPt = [n.nx, n.ny];
-        if (laserDot) laserDot.style.display = "none";
         redrawInk();
         sendLiveStroke(); // audience sees the ink immediately
       });
@@ -1354,15 +1391,15 @@
             redrawInk();
             sendLiveStroke();
           }
-          return;
-        }
-        if (eraserOn) {
+        } else if (eraserOn) {
           // live eraser ring follows the pointer
           eraserR = ev.ctrlKey ? ERASER_R * ERASER_SCALE : ERASER_R;
           positionEraserRing(n);
           if (ev.buttons & 1) eraseAt(n.nx, n.ny);
-          return;
         }
+        // The laser pointer is INDEPENDENT of the other tools: it may
+        // hover along while drawing or erasing, so the audience dot
+        // keeps following the pen instead of freezing mid-stroke.
         if (laserOn) {
           sendPointer(n.nx, n.ny, n.inside);
           if (laserDot) {

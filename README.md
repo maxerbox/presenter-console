@@ -33,11 +33,11 @@ get a two-window presenter setup:
     line's baseline sits at the click point, `Escape`/`Ctrl+Enter` (or clicking
     elsewhere) commits, an empty editor is discarded. The **size dropdown** next
     to it sets the default font size (relative to slide height, like pdf.js'
-    size input); annotations are stored per deck/page like strokes and mirror
-    to the audience window as SVG text.
-  - **🝆 Eraser** — drag over marker strokes or text to delete them (hold
-    `Ctrl` for a larger radius; a ring shows the erase area). Works on both
-    kinds of annotations, and erasures can be undone like anything else.
+    size input); annotations are stored per deck/page like strokes and mirror to
+    the audience window as SVG text.
+  - **🝆 Eraser** — drag over marker strokes or text to delete them (hold `Ctrl`
+    for a larger radius; a ring shows the erase area). Works on both kinds of
+    annotations, and erasures can be undone like anything else.
   - **↩ Undo / 🗑 Trash** — undo the last stroke, text or erasure (Ctrl+Z works
     too, also inside the text editor's history); trash wipes every page's
     annotations. Undo history is per session.
@@ -106,12 +106,11 @@ presenter/
 - Pointer, marker and text traffic travels over the same channel (`pointer`,
   `tools`, `strokes`, `strokeLive`, `strokesClearAll` messages — text
   annotations ride along in the per-page stroke lists as `{kind:"text", …}`
-  entries). The shim re-injects its overlay (an SVG + a positioned dot) into
-  the current page div whenever pdf.js rebuilds it, and the console re-adopts
-  the audience popup after a console reload via a periodic `hello` heartbeat.
-  Deck opens in the viewer are serialized and `goto`s that arrive before pages
-  exist are deferred, so a reloaded console can never crash the viewer
-  mid-open.
+  entries). The shim re-injects its overlay (an SVG + a positioned dot) into the
+  current page div whenever pdf.js rebuilds it, and the console re-adopts the
+  audience popup after a console reload via a periodic `hello` heartbeat. Deck
+  opens in the viewer are serialized and `goto`s that arrive before pages exist
+  are deferred, so a reloaded console can never crash the viewer mid-open.
 - Page numbers are identical console↔audience (same underlying document), so
   sync is plain page numbers — no text mapping needed.
 - Re-picking a PDF while the audience window is open pushes the new cropped deck
