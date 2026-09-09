@@ -104,10 +104,7 @@
 
   function appendStrokePath(svg, s) {
     if (!s.pts || !s.pts.length) return;
-    const path = document.createElementNS(
-      "http://www.w3.org/2000/svg",
-      "path",
-    );
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
     path.setAttribute("d", strokePathD(s));
     path.setAttribute("fill", "none");
     path.setAttribute("stroke", s.color || "rgba(230,30,30,0.9)");
@@ -119,6 +116,32 @@
     return path;
   }
 
+  // Text annotation (pdf.js FreeText-style): (nx, ny) is the baseline
+  // start of the first line, size a fraction of the slide height.
+  // Rendered in the viewBox-1000 space so it scales with the slide.
+  function appendText(svg, t) {
+    if (!t.txt) return;
+    const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    const size = (t.size || 0.045) * 1000;
+    const lines = t.txt.split("\n");
+    // <tspan> per line: x at the anchor, y stepping by 1.35em like the
+    // console's canvas renderer (LINE_FACTOR 1.35, same as pdf.js)
+    lines.forEach((ln, i) => {
+      const ts = document.createElementNS("http://www.w3.org/2000/svg", "tspan");
+      ts.setAttribute("x", t.nx * 1000);
+      ts.setAttribute("y", (t.ny + i * (t.size || 0.045) * 1.35) * 1000);
+      ts.textContent = ln;
+      text.appendChild(ts);
+    });
+    text.setAttribute("fill", t.color || "rgba(230,30,30,0.9)");
+    text.setAttribute("font-family", "Helvetica Neue, Helvetica, Arial, sans-serif");
+    text.setAttribute("font-size", size);
+    text.setAttribute("dominant-baseline", "auto"); // default: baseline at y
+    text.style.userSelect = "none";
+    svg.appendChild(text);
+    return text;
+  }
+
   function renderStrokes() {
     const svg = toolsOverlay.svg;
     if (!svg) return;
@@ -126,7 +149,8 @@
     toolsOverlay.livePath = null;
     const cur = currentPageNumber();
     for (const s of toolsOverlay.strokes.get(cur) || []) {
-      appendStrokePath(svg, s);
+      if (s.kind === "text") appendText(svg, s);
+      else appendStrokePath(svg, s);
     }
     // in-progress stroke from the console: rendered on top of the
     // stored list so the audience sees the ink WHILE it is drawn
@@ -136,7 +160,6 @@
       toolsOverlay.livePath = appendStrokePath(svg, live.stroke);
     }
   }
-
   // Update ONLY the in-progress stroke's path (cheap: one attribute
   // write, no list rebuild) — called on every live update from the
   // console while the presenter is drawing.
@@ -602,6 +625,12 @@
   }
   tryWire(80); // ~20s
 
+  // Serialized deck opens (a concurrent second app.open() would tear
+  // down the viewer's page views mid-navigation) and the page number
+  // of a goto that arrived before any pages existed.
+  let openChain = null;
+  let pendingGoto = null;
+
   // Heartbeat: the console page can reload (F5) and lose its reference
   // to this popup.  A periodic hello lets a reloaded console re-adopt
   // this window and re-push the deck; the console ignores hellos while
@@ -624,16 +653,46 @@
       toolsOverlay.pointer = { x: 0, y: 0, visible: false };
       // Push the picked deck bytes into the official viewer.  Copy the
       // buffer: pdf.js transfers/detaches the ArrayBuffer it renders.
+      // Serialized: a second open while one is in flight would tear
+      // down _pages mid-navigation and crash #scrollIntoView.
       const data =
         d.data instanceof Uint8Array ? new Uint8Array(d.data) : d.data;
-      Promise.resolve(app.open({ data, filename: "slides.pdf" }))
+      openChain = (openChain || Promise.resolve())
+        .then(() => app.open({ data, filename: "slides.pdf" }))
         .then(() => post({ type: "loaded" }))
         .catch((e) => {
           console.error("shim: failed to open pushed deck", e);
           post({ type: "loaded" }); // still report; console shows status
         });
     } else if (d.type === "goto") {
-      if (app && app.pdfViewer) app.pdfViewer.currentPageNumber = d.page;
+      // Guard: setting currentPageNumber before the viewer has page
+      // views (mid-open, or an empty viewer) throws inside pdf.js'
+      // #scrollIntoView — hold the page until pages exist, then jump.
+      const viewer = app?.pdfViewer;
+      if (!viewer) return;
+      if (viewer.pagesCount > 0) {
+        try {
+          viewer.currentPageNumber = d.page;
+        } catch (e) {
+          // defensive: never let a sync jump break the shim
+          console.warn("shim: goto failed", e);
+        }
+      } else {
+        pendingGoto = d.page;
+        const apply = () => {
+          if (pendingGoto === null || !app?.pdfViewer) return;
+          const n = pendingGoto;
+          pendingGoto = null;
+          try {
+            app.pdfViewer.currentPageNumber = n;
+          } catch (e) {
+            console.warn("shim: deferred goto failed", e);
+          }
+        };
+        app.eventBus?.once?.("pagesinit", apply);
+        app.eventBus?.once?.("pagesloaded", apply);
+        setTimeout(apply, 500); // fallback for missed events
+      }
     } else if (d.type === "pointer") {
       toolsOverlay.pointer = { x: d.x, y: d.y, visible: d.visible };
       applyPointer();

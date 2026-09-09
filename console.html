@@ -62,6 +62,55 @@
       #slidewrap.marker-cursor {
         cursor: crosshair;
       }
+      #slidewrap.text-cursor {
+        cursor: text;
+      }
+      #slidewrap.eraser-cursor {
+        cursor: none; /* the ring is the cursor */
+      }
+      /* In-place text editor (pdf.js FreeText-style): a contentEditable
+         div over the slide; click to place, type, Esc/Ctrl+Enter (or
+         clicking elsewhere) commits. */
+      .text-editor {
+        position: absolute;
+        line-height: 1.35;
+        white-space: pre;
+        font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+        color: rgba(230, 30, 30, 0.9);
+        background: transparent;
+        border: none;
+        outline: 1px dashed rgba(255, 255, 255, 0.35);
+        outline-offset: 2px;
+        min-width: 1em;
+        min-height: 1em;
+        padding: 0;
+        margin: 0;
+        z-index: 6;
+        caret-color: #fff;
+      }
+      .text-editor:empty::before {
+        content: "Start typing…";
+        color: rgba(255, 255, 255, 0.4);
+      }
+      /* Eraser radius indicator, follows the pointer while the eraser
+         tool is ON */
+      .eraser-ring {
+        position: absolute;
+        display: none;
+        border: 2px solid rgba(255, 255, 255, 0.85);
+        border-radius: 50%;
+        transform: translate(-50%, -50%);
+        pointer-events: none;
+        z-index: 5;
+      }
+      #topbar select {
+        background: #333;
+        color: #eee;
+        border: 1px solid #555;
+        border-radius: 4px;
+        padding: 4px 6px;
+        font-size: 13px;
+      }
       /* Stage wrapping the current-slide canvas: hosts the marker
          overlay canvas and the console-local laser dot on top of the
          rendered PDF half. */
@@ -300,6 +349,33 @@
         &#9998; Marker
       </button>
       <button
+        id="textToggle"
+        class="tool-btn"
+        title="Text: click on the current slide and type — pdf.js FreeText-style annotations, kept per page, shown in the audience window, survive reloads"
+      >
+        &#128396; Text
+      </button>
+      <label
+        for="fontSelect"
+        title="Default font size for new text annotations (relative to the slide height)"
+        style="color: #9ab"
+        >size</label
+      >
+      <select id="fontSelect" title="Text size (fraction of slide height)">
+        <option value="0.03">S</option>
+        <option value="0.045" selected>M</option>
+        <option value="0.06">L</option>
+        <option value="0.08">XL</option>
+        <option value="0.11">XXL</option>
+      </select>
+      <button
+        id="eraserToggle"
+        class="tool-btn"
+        title="Eraser: drag over marker strokes or text annotations to delete them (Ctrl+drag enlarges the radius)"
+      >
+        &#129525; Eraser
+      </button>
+      <button
         id="undoInk"
         title="Undo the last marker action (Ctrl+Z)"
         disabled
@@ -448,6 +524,7 @@
       // derived from it in-browser with pdf-lib CropBox surgery.
       async function loadFile(file) {
         try {
+          commitTextEditor(); // don't carry a draft across decks
           setStatus("loading PDF…");
           pdfBytes = new Uint8Array(await file.arrayBuffer());
           // Per-deck identity for the marker storage (FNV-1a of the
@@ -523,10 +600,16 @@
         return await doc.save();
       }
 
+      let deckPushId = 0; // coalesces overlapping pushDeck() calls
       async function pushDeck() {
+        const id = ++deckPushId;
         try {
           setStatus("preparing audience deck…");
           const bytes = await makeAudienceDeck();
+          // A newer push superseded this one (e.g. the hello-heartbeat
+          // adoption raced loadFile's own push): post only the last one,
+          // else the viewer opens the same deck twice concurrently.
+          if (id !== deckPushId) return;
           audience.postMessage({ type: "load", data: bytes }, "*");
           setStatus("deck pushed to audience window");
         } catch (e) {
@@ -623,6 +706,7 @@
       // ---- controls -----------------------------------------------------------
       function goTo(n) {
         if (!notesPdf || n < 1 || n > total) return;
+        commitTextEditor(); // finish typing before the stage is rebuilt
         page = n;
         timer.start();
         showPage(page);
@@ -642,7 +726,11 @@
       $("timer").addEventListener("click", resetTimer);
 
       window.addEventListener("keydown", (ev) => {
-        if (ev.target && /^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName))
+        if (
+          ev.target &&
+          (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) ||
+            ev.target.isContentEditable)
+        )
           return;
         if (!notesPdf) return;
         switch (ev.key) {
@@ -708,18 +796,29 @@
       const TOOLS_KEY = "pc.tools.v1";
       const INK_COLOR = "rgba(230,30,30,0.9)";
       const INK_WIDTH = 0.0045; // stroke width, fraction of slide width
+      const ERASER_R = 0.025; // eraser radius, fraction of slide width
+      const ERASER_SCALE = 2.5; // Ctrl enlarges the radius this much
+      // Default text size (fraction of slide height), set from the
+      // #fontSelect dropdown; persisted in the tools state.
+      let defaultFontSize = 0.045;
 
       let docKey = null; // identity of the picked PDF (ink storage key)
-      let ink = {}; // page -> [ {pts:[[nx,ny],...], color, width} ]
+      let ink = {}; // page -> [ {kind:"stroke",pts,…} | {kind:"text",txt,…} ]
       let inkHistory = []; // {type:"add",page} | {type:"clear",snapshot}
       let laserOn = false;
       let markerOn = false;
+      let textOn = false;
+      let eraserOn = false;
       let drawing = null; // stroke in progress
       let lastPt = null; // last appended point (distance throttle)
+      let textEditor = null; // DOM div while typing
+      let textEditing = null; // {page, draft:{nx,ny,size,txt}} while typing
+      let eraserR = ERASER_R; // current radius (Ctrl scales)
       let slidePdfCanvas = null;
       let inkCanvas = null;
       let inkCtx = null;
       let laserDot = null;
+      let eraserRing = null;
 
       // FNV-1a over the file bytes: fast, stable per-deck storage key.
       function fnv1a(bytes) {
@@ -737,6 +836,12 @@
           if (t && typeof t === "object") {
             laserOn = !!t.laser;
             markerOn = !!t.marker;
+            textOn = !!t.text;
+            eraserOn = !!t.eraser;
+            if (typeof t.fontSize === "number" && t.fontSize > 0) {
+              defaultFontSize = t.fontSize;
+              syncFontSelect();
+            }
           }
         } catch {}
       }
@@ -744,7 +849,13 @@
         try {
           localStorage.setItem(
             TOOLS_KEY,
-            JSON.stringify({ laser: laserOn, marker: markerOn }),
+            JSON.stringify({
+              laser: laserOn,
+              marker: markerOn,
+              text: textOn,
+              eraser: eraserOn,
+              fontSize: defaultFontSize,
+            }),
           );
         } catch {}
       }
@@ -774,6 +885,7 @@
         const pdfCanvas = pane.querySelector("canvas");
         if (!pdfCanvas) {
           slidePdfCanvas = inkCanvas = inkCtx = laserDot = null;
+          eraserRing = null;
           return;
         }
         const stage = document.createElement("div");
@@ -784,8 +896,10 @@
         inkCanvas.height = pdfCanvas.height;
         laserDot = document.createElement("div");
         laserDot.className = "laser-dot";
+        eraserRing = document.createElement("div");
+        eraserRing.className = "eraser-ring";
         pane.replaceChildren(stage);
-        stage.append(pdfCanvas, inkCanvas, laserDot);
+        stage.append(pdfCanvas, inkCanvas, laserDot, eraserRing);
         slidePdfCanvas = pdfCanvas;
         inkCtx = inkCanvas.getContext("2d");
       }
@@ -829,13 +943,75 @@
         ctx.restore();
       }
 
+      // Draw a text annotation: (nx, ny) is the BASELINE-START anchor
+      // (pdf.js FreeText places the first line's baseline at the click
+      // point); size is a fraction of the slide height.
+      function drawText(ctx, t, W, H) {
+        if (!t.txt) return;
+        ctx.save();
+        ctx.fillStyle = t.color || INK_COLOR;
+        ctx.font = `${(t.size || defaultFontSize) * H}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
+        ctx.textBaseline = "alphabetic";
+        const lines = t.txt.split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          ctx.fillText(lines[i], t.nx * W, (t.ny + i * (t.size || defaultFontSize) * 1.35) * H);
+        }
+        ctx.restore();
+      }
+
+      // Does a stroke pass within `r` (normalized units) of (x, y)?
+      function strokeHit(s, x, y, r) {
+        const pts = s.pts || [];
+        const r2 = r * r;
+        for (const [px, py] of pts) {
+          const dx = px - x;
+          const dy = py - y;
+          if (dx * dx + dy * dy <= r2) return true;
+        }
+        return false;
+      }
+
+      // Does a text annotation's bounding box come within `r` of (x, y)?
+      function textHit(t, x, y, r, W, H) {
+        if (!t.txt) return false;
+        const size = (t.size || defaultFontSize) * H; // px
+        const lines = t.txt.split("\n");
+        // measure at buffer scale for accuracy
+        inkCtx.save();
+        inkCtx.font = `${size}px "Helvetica Neue", Helvetica, Arial, sans-serif`;
+        let wMax = 0;
+        for (const ln of lines) {
+          wMax = Math.max(wMax, inkCtx.measureText(ln).width);
+        }
+        inkCtx.restore();
+        const bw = wMax / W; // normalized width
+        const bh = (lines.length * size * 1.35) / H; // normalized height
+        // bbox in normalized coords: x from nx, y from baseline up
+        const x0 = t.nx - r;
+        const x1 = t.nx + bw + r;
+        const y0 = t.ny - lines.length * ((t.size || defaultFontSize) * 1.35) - r;
+        const y1 = t.ny + r;
+        return x >= x0 && x <= x1 && y >= y0 && y <= y1;
+      }
+
       function redrawInk() {
         if (!inkCtx || !inkCanvas) return;
         const W = inkCanvas.width;
         const H = inkCanvas.height;
         inkCtx.clearRect(0, 0, W, H);
-        for (const s of ink[page] || []) drawStroke(inkCtx, s, W, H);
+        for (const a of ink[page] || []) {
+          if (a.kind === "text") drawText(inkCtx, a, W, H);
+          else drawStroke(inkCtx, a, W, H);
+        }
         if (drawing) drawStroke(inkCtx, drawing, W, H);
+        if (textEditing && textEditing.page === page) {
+          drawText(
+            inkCtx,
+            { ...textEditing.draft, txt: textEditing.draft.txt || "" },
+            W,
+            H,
+          );
+        }
       }
 
       // ---- audience sync (pointer + strokes, rAF-throttled) ----------
@@ -853,7 +1029,11 @@
       function sendTools() {
         if (audience && !audience.closed)
           audience.postMessage(
-            { type: "tools", laser: laserOn, marker: markerOn },
+            {
+              type: "tools",
+              laser: laserOn,
+              marker: markerOn,
+            },
             "*",
           );
       }
@@ -882,7 +1062,13 @@
               {
                 type: "strokeLive",
                 page,
-                stroke: drawing ? { pts: drawing.pts, color: drawing.color, width: drawing.width } : null,
+                stroke: drawing
+                  ? {
+                      pts: drawing.pts,
+                      color: drawing.color,
+                      width: drawing.width,
+                    }
+                  : null,
               },
               "*",
             );
@@ -895,24 +1081,82 @@
       }
       function updateCursor() {
         $("slidewrap").classList.toggle("marker-cursor", markerOn);
+        $("slidewrap").classList.toggle("text-cursor", textOn);
+        $("slidewrap").classList.toggle("eraser-cursor", eraserOn);
       }
 
+      function setMarker(on) {
+        markerOn = on;
+        if (on) {
+          laserOn = false;
+          textOn = false;
+          eraserOn = false;
+        }
+        saveTools();
+        syncToolButtons();
+        updateCursor();
+        sendTools();
+      }
+      function setText(on) {
+        textOn = on;
+        if (on) {
+          laserOn = false;
+          markerOn = false;
+          eraserOn = false;
+        }
+        saveTools();
+        syncToolButtons();
+        updateCursor();
+        sendTools();
+      }
+      function setEraser(on) {
+        eraserOn = on;
+        if (on) {
+          laserOn = false;
+          markerOn = false;
+          textOn = false;
+        }
+        if (!on && eraserRing) eraserRing.style.display = "none";
+        saveTools();
+        syncToolButtons();
+        updateCursor();
+        sendTools();
+      }
       function setLaser(on) {
         laserOn = on;
-        saveTools();
-        $("laserToggle").classList.toggle("active", laserOn);
+        if (on) {
+          markerOn = false;
+          textOn = false;
+          eraserOn = false;
+        }
         if (!laserOn) {
           sendPointer(0, 0, false);
           if (laserDot) laserDot.style.display = "none";
         }
-        sendTools();
-      }
-      function setMarker(on) {
-        markerOn = on;
         saveTools();
-        $("markerToggle").classList.toggle("active", markerOn);
+        syncToolButtons();
         updateCursor();
         sendTools();
+      }
+      function syncToolButtons() {
+        $("laserToggle").classList.toggle("active", laserOn);
+        $("markerToggle").classList.toggle("active", markerOn);
+        $("textToggle").classList.toggle("active", textOn);
+        $("eraserToggle").classList.toggle("active", eraserOn);
+      }
+      function syncFontSelect() {
+        const sel = $("fontSelect");
+        let best = null;
+        for (const opt of sel.options) {
+          const v = parseFloat(opt.value);
+          if (v === defaultFontSize) {
+            best = opt;
+            break;
+          }
+          if (!best || Math.abs(v - defaultFontSize) < Math.abs(parseFloat(best.value) - defaultFontSize))
+            best = opt;
+        }
+        if (best) sel.value = best.value;
       }
 
       function undoInk() {
@@ -924,6 +1168,16 @@
         if (a.type === "add") {
           const list = ink[a.page] || [];
           list.pop();
+          if (!list.length) delete ink[a.page];
+          saveInk();
+          pushStrokes(a.page);
+          if (a.page === page) redrawInk();
+        } else if (a.type === "erase") {
+          // re-insert erased items at their original positions
+          const list = (ink[a.page] ||= []);
+          [...a.removed]
+            .sort((p, q) => q.index - p.index)
+            .forEach(({ index, item }) => list.splice(index, 0, item));
           if (!list.length) delete ink[a.page];
           saveInk();
           pushStrokes(a.page);
@@ -953,14 +1207,134 @@
 
       // ---- drawing / hovering on the current slide --------------------
       const slidePane = $("slidewrap");
+
+      // Commit the in-progress text annotation (pdf.js FreeText-style:
+      // empty text removes the editor). Returns true if committed.
+      function commitTextEditor() {
+        const div = textEditor;
+        if (!div || !textEditing) return false;
+        const txt = (div.innerText || "").replace(/\u00a0/g, " ").trimEnd();
+        const { page: p, draft } = textEditing;
+        // null the refs FIRST: removing the focused div fires `blur`
+        // synchronously, and the blur handler must see nothing to do
+        textEditor = null;
+        textEditing = null;
+        div.remove();
+        if (txt) {
+          const item = { kind: "text", ...draft, txt };
+          (ink[p] ||= []).push(item);
+          inkHistory.push({ type: "add", page: p });
+          if (inkHistory.length > 200) inkHistory.shift();
+          saveInk();
+          pushStrokes(p);
+          redrawInk();
+          updateInkButtons();
+        } else {
+          redrawInk();
+        }
+        return true;
+      }
+
+      // Start in-place text editing at normalized (nx, ny) — the click
+      // point is the FIRST BASELINE start (pdf.js FreeText semantics).
+      function startTextEditor(nx, ny) {
+        commitTextEditor(); // only one editor at a time
+        const stage = document.querySelector("#slidewrap .slide-stage");
+        if (!stage || !slidePdfCanvas) return;
+        const r = slidePdfCanvas.getBoundingClientRect();
+        const bufW = slidePdfCanvas.width;
+        const bufH = slidePdfCanvas.height;
+        const scale = Math.min(r.width / bufW, r.height / bufH);
+        const dispW = bufW * scale;
+        const dispH = bufH * scale;
+        const offX = (r.width - dispW) / 2;
+        const offY = (r.height - dispH) / 2;
+        const div = document.createElement("div");
+        div.className = "text-editor";
+        div.contentEditable = "true";
+        // display font size in px, relative to the DISPLAYED slide height
+        const fsPx = defaultFontSize * dispH;
+        div.style.fontSize = fsPx + "px";
+        // position: (nx, ny) is normalized in the slide; the baseline
+        // of the first line sits at the click point → top = ny - ascent
+        div.style.left = offX + nx * dispW + "px";
+        div.style.top = offY + (ny - defaultFontSize) * dispH + "px";
+        div.style.color = INK_COLOR;
+        stage.appendChild(div);
+        textEditor = div;
+        textEditing = { page, draft: { nx, ny, size: defaultFontSize, txt: "" } };
+        div.addEventListener("keydown", (ev) => {
+          ev.stopPropagation();
+          if (ev.key === "Escape" || (ev.ctrlKey && ev.key === "Enter")) {
+            ev.preventDefault();
+            commitTextEditor();
+          }
+        });
+        // pdf.js FreeText commits on blur too — but commitTextEditor
+        // nulls the refs before .remove() so this can't double-fire
+        div.addEventListener("blur", () => commitTextEditor());
+        div.addEventListener("input", () => {
+          if (textEditing) textEditing.draft.txt = div.innerText;
+        });
+        // Focus synchronously: the div is already in the DOM, so the
+        // caret is ready before the user's first keystroke can land
+        // (a stray Space would otherwise advance the slide).
+        div.focus();
+        setTimeout(() => {
+          if (textEditor === div) div.focus(); // belt and braces
+        }, 0);
+      }
+
+      // Erase annotations intersecting the eraser radius at (nx, ny).
+      function eraseAt(nx, ny) {
+        const list = ink[page];
+        if (!list || !list.length) return;
+        const W = inkCanvas?.width || 1;
+        const H = inkCanvas?.height || 1;
+        const removed = [];
+        const kept = [];
+        list.forEach((a, i) => {
+          const hit =
+            a.kind === "text"
+              ? textHit(a, nx, ny, eraserR, W, H)
+              : strokeHit(a, nx, ny, eraserR);
+          if (hit) removed.push({ index: i, item: a });
+          else kept.push(a);
+        });
+        if (!removed.length) return;
+        ink[page] = kept;
+        if (!kept.length) delete ink[page];
+        inkHistory.push({ type: "erase", page, removed });
+        if (inkHistory.length > 200) inkHistory.shift();
+        saveInk();
+        pushStrokes(page);
+        redrawInk();
+        updateInkButtons();
+      }
+
       slidePane.addEventListener("pointerdown", (ev) => {
-        if (!markerOn || ev.button !== 0 || !inkCtx) return;
+        if (ev.button !== 0) return;
         const n = normFromEvent(ev);
         if (!n || !n.inside) return;
+        if (textOn) {
+          ev.preventDefault();
+          startTextEditor(n.nx, n.ny);
+          return;
+        }
+        if (eraserOn) {
+          ev.preventDefault();
+          try {
+            slidePane.setPointerCapture(ev.pointerId);
+          } catch {}
+          eraserR = ev.ctrlKey ? ERASER_R * ERASER_SCALE : ERASER_R;
+          eraseAt(n.nx, n.ny);
+          return;
+        }
+        if (!markerOn || !inkCtx) return;
         try {
           slidePane.setPointerCapture(ev.pointerId);
         } catch {}
-        drawing = { pts: [[n.nx, n.ny]], color: INK_COLOR, width: INK_WIDTH };
+        drawing = { kind: "stroke", pts: [[n.nx, n.ny]], color: INK_COLOR, width: INK_WIDTH };
         lastPt = [n.nx, n.ny];
         if (laserDot) laserDot.style.display = "none";
         redrawInk();
@@ -982,6 +1356,13 @@
           }
           return;
         }
+        if (eraserOn) {
+          // live eraser ring follows the pointer
+          eraserR = ev.ctrlKey ? ERASER_R * ERASER_SCALE : ERASER_R;
+          positionEraserRing(n);
+          if (ev.buttons & 1) eraseAt(n.nx, n.ny);
+          return;
+        }
         if (laserOn) {
           sendPointer(n.nx, n.ny, n.inside);
           if (laserDot) {
@@ -995,6 +1376,7 @@
         }
       });
       const endStroke = (ev) => {
+        if (eraserOn && ev.buttons === 0) return; // erase ended
         if (!drawing) return;
         try {
           if (
@@ -1017,11 +1399,31 @@
       slidePane.addEventListener("pointerup", endStroke);
       slidePane.addEventListener("pointercancel", endStroke);
       slidePane.addEventListener("pointerleave", () => {
+        if (eraserRing) eraserRing.style.display = "none";
         if (laserOn) {
           sendPointer(0, 0, false);
           if (laserDot) laserDot.style.display = "none";
         }
       });
+      function positionEraserRing(n) {
+        if (!eraserRing || !slidePdfCanvas) return;
+        const r = slidePdfCanvas.getBoundingClientRect();
+        const bufW = slidePdfCanvas.width;
+        const bufH = slidePdfCanvas.height;
+        const scale = Math.min(r.width / bufW, r.height / bufH);
+        const dispW = bufW * scale;
+        const dispH = bufH * scale;
+        const offX = (r.width - dispW) / 2;
+        const offY = (r.height - dispH) / 2;
+        const x = offX + n.nx * dispW;
+        const y = offY + n.ny * dispH;
+        const rx = eraserR * dispW; // ring radius in px
+        eraserRing.style.left = x + "px";
+        eraserRing.style.top = y + "px";
+        eraserRing.style.width = 2 * rx + "px";
+        eraserRing.style.height = 2 * rx + "px";
+        eraserRing.style.display = "block";
+      }
       function positionDot(n) {
         const r = slidePdfCanvas.getBoundingClientRect();
         const bufW = slidePdfCanvas.width;
@@ -1035,17 +1437,30 @@
 
       $("laserToggle").addEventListener("click", () => setLaser(!laserOn));
       $("markerToggle").addEventListener("click", () => setMarker(!markerOn));
+      $("textToggle").addEventListener("click", () => setText(!textOn));
+      $("eraserToggle").addEventListener("click", () => setEraser(!eraserOn));
+      $("fontSelect").addEventListener("change", () => {
+        defaultFontSize = parseFloat($("fontSelect").value) || 0.045;
+        saveTools();
+      });
       $("undoInk").addEventListener("click", undoInk);
       $("clearInk").addEventListener("click", clearInk);
       window.addEventListener("keydown", (ev) => {
+        // don't steal Ctrl+Z from the text editor or form controls
+        if (
+          ev.target &&
+          (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) ||
+            ev.target.isContentEditable)
+        )
+          return;
         if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "z") {
           ev.preventDefault();
           undoInk();
         }
       });
       loadTools();
-      $("laserToggle").classList.toggle("active", laserOn);
-      $("markerToggle").classList.toggle("active", markerOn);
+      syncToolButtons();
+      syncFontSelect();
       updateCursor();
       updateInkButtons();
     </script>

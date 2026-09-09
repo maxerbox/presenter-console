@@ -26,12 +26,23 @@ get a two-window presenter setup:
     zoom or presentation mode.
   - **✎ Marker** — draw freehand on the current slide; strokes appear on the
     audience slide as a screen-only overlay, **live while you draw** (like
-    pdf.js' own pencil tool). Strokes are stored per deck (content-hashed)
-    and per page in `localStorage`, so they survive console reloads and page
-    turns. Drawing never disturbs played animations.
-  - **↩ Undo / 🗑 Trash** — undo the last stroke or clear-all (Ctrl+Z works
-    too); trash wipes every page's annotations. Undo history is per session.
-  - Divider sizes and tool toggles are remembered across sessions.
+    pdf.js' own pencil tool). Strokes are stored per deck (content-hashed) and
+    per page in `localStorage`, so they survive console reloads and page turns.
+    Drawing never disturbs played animations.
+  - **🖌 Text** — click on the slide and type (pdf.js FreeText-style): the first
+    line's baseline sits at the click point, `Escape`/`Ctrl+Enter` (or clicking
+    elsewhere) commits, an empty editor is discarded. The **size dropdown** next
+    to it sets the default font size (relative to slide height, like pdf.js'
+    size input); annotations are stored per deck/page like strokes and mirror
+    to the audience window as SVG text.
+  - **🝆 Eraser** — drag over marker strokes or text to delete them (hold
+    `Ctrl` for a larger radius; a ring shows the erase area). Works on both
+    kinds of annotations, and erasures can be undone like anything else.
+  - **↩ Undo / 🗑 Trash** — undo the last stroke, text or erasure (Ctrl+Z works
+    too, also inside the text editor's history); trash wipes every page's
+    annotations. Undo history is per session.
+  - Divider sizes, tool toggles and the font size are remembered across
+    sessions.
 
 ## Layout
 
@@ -92,11 +103,15 @@ presenter/
   subscribes `pagechanging` on its eventBus and `postMessage`s the page to the
   console; the console sends `goto` and the cropped deck bytes
   (`{type:"load", data}` → `PDFViewerApplication.open({data, filename})`).
-- Pointer and marker traffic travels over the same channel (`pointer`, `tools`,
-  `strokes`, `strokesClearAll` messages). The shim re-injects its overlay (an
-  SVG + a positioned dot) into the current page div whenever pdf.js rebuilds it,
-  and the console re-adopts the audience popup after a console reload via a
-  periodic `hello` heartbeat.
+- Pointer, marker and text traffic travels over the same channel (`pointer`,
+  `tools`, `strokes`, `strokeLive`, `strokesClearAll` messages — text
+  annotations ride along in the per-page stroke lists as `{kind:"text", …}`
+  entries). The shim re-injects its overlay (an SVG + a positioned dot) into
+  the current page div whenever pdf.js rebuilds it, and the console re-adopts
+  the audience popup after a console reload via a periodic `hello` heartbeat.
+  Deck opens in the viewer are serialized and `goto`s that arrive before pages
+  exist are deferred, so a reloaded console can never crash the viewer
+  mid-open.
 - Page numbers are identical console↔audience (same underlying document), so
   sync is plain page numbers — no text mapping needed.
 - Re-picking a PDF while the audience window is open pushes the new cropped deck
