@@ -731,6 +731,11 @@
           case "pagechange":
             if (!audienceReady) break; // deck re-opening — realigned on "loaded"
             if (d.total) total = d.total;
+            // Our own goto echoed back (the audience followed us): the
+            // console is already on this page — re-running showPage would
+            // invalidate the in-flight render and start it over, doubling
+            // the turn latency on big decks.  Only follow EXTERNAL turns.
+            if (d.page === page) break;
             page = d.page;
             timer.start();
             showPage(page);
@@ -741,8 +746,10 @@
             if (d.visible && laserDot) {
               positionDot({ nx: d.x, ny: d.y });
               laserDot.style.display = "block";
+              lastPointer = { nx: d.x, ny: d.y, inside: true };
             } else if (laserDot) {
               laserDot.style.display = "none";
+              lastPointer = { ...lastPointer, inside: false };
             }
             break;
         }
@@ -831,6 +838,18 @@
         if (!notesPdf) return;
         const stale = () => token !== renderToken;
         try {
+          // Next-slide preview renders IN PARALLEL with the current slide
+          // + notes: it used to start only after both completed, so on big
+          // decks the preview kept showing the OLD slide for a full extra
+          // render cycle after the current slide had already switched —
+          // a visible double-switch on every turn.  Started together, the
+          // three renders finish close to simultaneously.
+          const nextPreview =
+            n < total
+              ? renderHalf(notesPdf, n + 1, "left", $("nextwrap"), {
+                  cancelled: stale,
+                })
+              : Promise.resolve($("nextwrap").replaceChildren());
           await Promise.all([
             renderHalf(notesPdf, n, "right", $("noteswrap"), {
               cancelled: stale,
@@ -839,15 +858,12 @@
               cancelled: stale,
             }), // current slide
           ]);
-          if (stale()) return; // superseded — a newer showPage is on it
-          // Next-slide preview: render only if it fits the layout (skip on
-          // the last page).
-          if (n < total) {
-            renderHalf(notesPdf, n + 1, "left", $("nextwrap"), {
-              cancelled: stale,
-            });
-          } else {
-            $("nextwrap").replaceChildren();
+          if (stale()) {
+            // superseded — a newer showPage is on it.  Nobody awaits the
+            // preview anymore; swallow a late rejection instead of
+            // surfacing an unhandled promise rejection.
+            nextPreview.catch(() => {});
+            return;
           }
           // Wrap the fresh current-slide canvas in the marker stage,
           // repaint persisted strokes and keep the audience's stroke
@@ -855,6 +871,7 @@
           buildSlideStage();
           redrawInk();
           pushStrokes(n);
+          await nextPreview; // keep the same error/cancel semantics
         } catch (e) {
           if (!stale()) {
             console.error(e);
@@ -910,6 +927,10 @@
       let inkCtx = null;
       let laserDot = null;
       let eraserRing = null;
+      // Last pointer position inside the current slide (normalized), so
+      // the console dot can be re-shown when buildSlideStage() re-creates
+      // its element after a page turn — not only on the next pointermove.
+      let lastPointer = { nx: 0.5, ny: 0.5, inside: false };
 
       // FNV-1a over the file bytes: fast, stable per-deck storage key.
       function fnv1a(bytes) {
@@ -993,6 +1014,14 @@
         stage.append(pdfCanvas, inkCanvas, laserDot, eraserRing);
         slidePdfCanvas = pdfCanvas;
         inkCtx = inkCanvas.getContext("2d");
+        // Re-show the laser dot at its last position: page turns rebuild
+        // the stage, and a fresh .laser-dot would otherwise stay hidden
+        // until the presenter jiggles the mouse (pointermove is the only
+        // other thing that un-hides it).
+        if (laserOn && lastPointer.inside) {
+          positionDot(lastPointer);
+          laserDot.style.display = "block";
+        }
       }
 
       // Normalized slide coordinates for a pointer event, accounting
@@ -1496,6 +1525,7 @@
             }
           }
         }
+        lastPointer = { nx: n.nx, ny: n.ny, inside: n.inside };
       });
       const endStroke = (ev) => {
         if (eraserOn && ev.buttons === 0) return; // erase ended
@@ -1526,6 +1556,7 @@
           sendPointer(0, 0, false);
           if (laserDot) laserDot.style.display = "none";
         }
+        lastPointer = { ...lastPointer, inside: false };
       });
       function positionEraserRing(n) {
         if (!eraserRing || !slidePdfCanvas) return;
