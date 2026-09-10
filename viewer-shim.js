@@ -813,6 +813,28 @@
   // of a goto that arrived before any pages existed.
   let openChain = null;
   let pendingGoto = null;
+  let pendingGotoTimer = null;
+
+  // Apply the deferred goto once the viewer actually has pages; a
+  // direct goto can cancel it at any time (see the goto handler).
+  const clearPendingGoto = () => {
+    pendingGoto = null;
+    if (pendingGotoTimer !== null) {
+      clearTimeout(pendingGotoTimer);
+      pendingGotoTimer = null;
+    }
+  };
+  const applyPendingGoto = () => {
+    const viewer = window.PDFViewerApplication?.pdfViewer;
+    if (pendingGoto === null || !viewer || viewer.pagesCount === 0) return;
+    const n = pendingGoto;
+    clearPendingGoto();
+    try {
+      viewer.currentPageNumber = n;
+    } catch (e) {
+      console.warn("shim: deferred goto failed", e);
+    }
+  };
 
   // Heartbeat: the console page can reload (F5) and lose its reference
   // to this popup.  A periodic hello lets a reloaded console re-adopt
@@ -830,6 +852,7 @@
     const app = window.PDFViewerApplication;
     if (d.type === "load" && app && app.open) {
       // New deck: drop any presenter-tools state tied to the old one.
+      clearPendingGoto();
       removeToolsOverlay();
       toolsOverlay.strokes.clear();
       toolsOverlay.liveStroke = null;
@@ -852,9 +875,12 @@
       // Guard: setting currentPageNumber before the viewer has page
       // views (mid-open, or an empty viewer) throws inside pdf.js'
       // #scrollIntoView — hold the page until pages exist, then jump.
+      // A newer goto always supersedes any deferred one, so a stale
+      // fallback timer can never yank the deck back to an old page.
       const viewer = app?.pdfViewer;
       if (!viewer) return;
       if (viewer.pagesCount > 0) {
+        clearPendingGoto();
         try {
           viewer.currentPageNumber = d.page;
         } catch (e) {
@@ -862,20 +888,21 @@
           console.warn("shim: goto failed", e);
         }
       } else {
+        // pdf.js' EventBus has on/off only (no `once`), so use on/off
+        // pairs plus a timer; whichever fires first clears the rest.
+        clearPendingGoto();
         pendingGoto = d.page;
-        const apply = () => {
-          if (pendingGoto === null || !app?.pdfViewer) return;
-          const n = pendingGoto;
-          pendingGoto = null;
-          try {
-            app.pdfViewer.currentPageNumber = n;
-          } catch (e) {
-            console.warn("shim: deferred goto failed", e);
-          }
-        };
-        app.eventBus?.once?.("pagesinit", apply);
-        app.eventBus?.once?.("pagesloaded", apply);
-        setTimeout(apply, 500); // fallback for missed events
+        const bus = app.eventBus;
+        if (bus && typeof bus.on === "function") {
+          const onApply = () => {
+            bus.off("pagesinit", onApply);
+            bus.off("pagesloaded", onApply);
+            applyPendingGoto();
+          };
+          bus.on("pagesinit", onApply);
+          bus.on("pagesloaded", onApply);
+        }
+        pendingGotoTimer = setTimeout(applyPendingGoto, 500);
       }
     } else if (d.type === "pointer") {
       toolsOverlay.pointer = { x: d.x, y: d.y, visible: d.visible };

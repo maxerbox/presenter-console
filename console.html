@@ -310,12 +310,7 @@
   </head>
   <body>
     <div id="topbar">
-      <button
-        id="first"
-        title="First slide (Home)"
-      >
-        &#9198;
-      </button>
+      <button id="first" title="First slide (Home)">&#9198;</button>
       <button id="prev5" title="Back 5 slides (Ctrl+Left)">
         &#9664;&#9664; 5
       </button>
@@ -329,12 +324,7 @@
       <button id="next5" title="Forward 5 slides (Ctrl+Right)">
         5 &#9654;&#9654;
       </button>
-      <button
-        id="last"
-        title="Last slide (End)"
-      >
-        &#9197;
-      </button>
+      <button id="last" title="Last slide (End)">&#9197;</button>
       <button
         id="openAudience"
         title="Open the audience window (official pdf.js viewer — animations play)"
@@ -548,6 +538,7 @@
           // Per-deck identity for the marker storage (FNV-1a of the
           // bytes) + a fresh undo history.
           docKey = fnv1a(pdfBytes);
+          audienceDeckCache = { key: null, bytes: null }; // new deck → re-derive
           inkHistory = [];
           loadInk();
           updateInkButtons();
@@ -603,10 +594,28 @@
       // and links intact, so PDF-JavaScript animations still play.
       // Single-width pages (a regular deck picked by mistake) pass through
       // untouched.
+      //
+      // PERF (measured on a real 50MB / 61-page animate deck): pdf-lib's
+      // cooperative defaults made this take MINUTES in the real flow.
+      // (a) objectsPerTick defaults to 50 — the parse/serialize loop
+      //     yields via setTimeout every 50 objects, and this window is
+      //     OCCLUDED by the audience popup right when pushDeck() runs,
+      //     so Chromium throttles each yield to ~1/sec (5000+ objects
+      //     → minutes).  objectsPerTick: Infinity removes the yields
+      //     entirely (2.2s parse, unthrottled).
+      // (b) save() re-deflates every object stream (3.5s);
+      //     useObjectStreams: false writes the original stream bytes
+      //     through untouched (0.13s, 28x faster).  The output is
+      //     larger (~2.4x) but never leaves the tab — it goes to the
+      //     popup via structured-clone postMessage, no network.
+      // (c) updateFieldAppearances: false — we change no field values,
+      //     so re-rendering every animate widget's appearance is pure
+      //     waste (and could clobber the poster frames).
       async function makeAudienceDeck() {
         const { PDFDocument } = pdfLib;
         const doc = await PDFDocument.load(pdfBytes, {
           ignoreEncryption: true,
+          objectsPerTick: Infinity,
         });
         for (const p of doc.getPages()) {
           const { width, height } = p.getSize();
@@ -615,20 +624,38 @@
             p.setCropBox(mb.x, mb.y, width / 2, height);
           }
         }
-        return await doc.save();
+        return await doc.save({
+          objectsPerTick: Infinity,
+          updateFieldAppearances: false,
+          useObjectStreams: false,
+        });
       }
 
       let deckPushId = 0; // coalesces overlapping pushDeck() calls
+      // The derived deck is cached per docKey: the surgery is expensive
+      // on big decks and pushDeck() re-runs on every audience (re)open
+      // and on hello adoption after a console reload (F5).
+      let audienceDeckCache = { key: null, bytes: null };
       async function pushDeck() {
         const id = ++deckPushId;
         try {
-          setStatus("preparing audience deck…");
-          const bytes = await makeAudienceDeck();
+          if (audienceDeckCache.key !== docKey) {
+            setStatus("preparing audience deck…");
+            const t0 = performance.now();
+            const bytes = await makeAudienceDeck();
+            audienceDeckCache = { key: docKey, bytes };
+            setStatus(
+              `audience deck prepared in ${((performance.now() - t0) / 1000).toFixed(1)}s`,
+            );
+          }
           // A newer push superseded this one (e.g. the hello-heartbeat
           // adoption raced loadFile's own push): post only the last one,
           // else the viewer opens the same deck twice concurrently.
           if (id !== deckPushId) return;
-          audience.postMessage({ type: "load", data: bytes }, "*");
+          audience.postMessage(
+            { type: "load", data: audienceDeckCache.bytes },
+            "*",
+          );
           setStatus("deck pushed to audience window");
         } catch (e) {
           console.error(e);
