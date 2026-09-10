@@ -126,11 +126,11 @@
       // single-point stroke (a tap): a move-only path renders nothing
       // — emit a tiny segment so the round linecap shows a dot, same
       // as the console canvas's drawStroke single-point handling
-      d += ` L ${s.pts[0][0] * 1000 + 0.5} ${s.pts[0][1] * 1000}`;
+      d += ` L ${s.pts[0][0] * 1000 + 0.5} ${s.pts[0][1] * vbH}`;
       return d;
     }
     for (let i = 1; i < s.pts.length; i++) {
-      d += ` L ${s.pts[i][0] * 1000} ${s.pts[i][1] * 1000}`;
+      d += ` L ${s.pts[i][0] * 1000} ${s.pts[i][1] * vbH}`;
     }
     return d;
   }
@@ -241,12 +241,28 @@
     ensureToolsOverlay(currentPageDiv());
   }
 
+  // Debounced pagechange: in presentation mode pdf.js fires the event
+  // up to 3x per turn (extra scale-change pass; mozilla/pdf.js #15745,
+  // WONTFIX upstream) — the middle pass echoes the DEPARTED page, so
+  // posting every echo makes the console jump forward then back.
+  // Coalesce the burst: report the last pagechanging, ~one task later,
+  // by which time the viewer's internal state has settled.  In normal
+  // mode a single event fires per turn; the short delay is imperceptible.
+  let pagechangeTimer = null;
   function wire(app) {
     if (!app || !app.eventBus) return false;
     app.eventBus.on("pagechanging", (evt) => {
-      post({ type: "pagechange", page: evt.pageNumber, total: app.pagesCount });
-      syncToolsOverlay();
-      renderStrokes();
+      if (pagechangeTimer !== null) clearTimeout(pagechangeTimer);
+      pagechangeTimer = setTimeout(() => {
+        pagechangeTimer = null;
+        post({
+          type: "pagechange",
+          page: currentPageNumber(),
+          total: app.pagesCount,
+        });
+        syncToolsOverlay();
+        renderStrokes();
+      }, 60);
     });
     patchScriptingForPresentationMode(app);
     toolsOverlay.app = app;

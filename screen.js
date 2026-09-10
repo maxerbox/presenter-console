@@ -15,7 +15,12 @@
 
 // Half to display: "left" = slide (audience), "right" = notes (console).
 // plain = a single-width page (deck without notes): show it as-is.
-async function renderHalf(pdf, pageNumber, half, canvasHost) {
+// opts.cancelled: optional predicate — when it turns true while the
+// render is in flight (a newer showPage superseded this one), the
+// finished canvas is NOT swapped in, so a slow render of an OLD page
+// can never overwrite a NEWER one (out-of-order completion race).
+async function renderHalf(pdf, pageNumber, half, canvasHost, opts) {
+  const cancelled = opts && opts.cancelled ? opts.cancelled : () => false;
   const page = await pdf.getPage(pageNumber);
   const vp0 = page.getViewport({ scale: 1 });
   const isDouble =
@@ -55,6 +60,8 @@ async function renderHalf(pdf, pageNumber, half, canvasHost) {
   });
   await task.promise;
   // Swap only after a successful render; on error keep the old canvas.
+  // A newer render superseded this one — drop it silently.
+  if (cancelled()) return;
   canvasHost.replaceChildren(canvas);
 }
 

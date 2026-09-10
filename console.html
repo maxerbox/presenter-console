@@ -310,12 +310,30 @@
   </head>
   <body>
     <div id="topbar">
+      <button
+        id="first"
+        title="First slide (Home)"
+      >
+        &#9198;
+      </button>
+      <button id="prev5" title="Back 5 slides (Ctrl+Left)">
+        &#9664;&#9664; 5
+      </button>
       <button id="prev" title="Previous slide (Left/PageUp)">
         &#9664; Prev
       </button>
       <span id="pageinfo">– / –</span>
       <button id="next" title="Next slide (Right/Space/PageDown)">
         Next &#9654;
+      </button>
+      <button id="next5" title="Forward 5 slides (Ctrl+Right)">
+        5 &#9654;&#9654;
+      </button>
+      <button
+        id="last"
+        title="Last slide (End)"
+      >
+        &#9197;
       </button>
       <button
         id="openAudience"
@@ -714,8 +732,15 @@
       }
       const next = () => goTo(page + 1);
       const prev = () => goTo(page - 1);
+      const first = () => goTo(1);
+      const last = () => goTo(total);
+      const jump = (delta) => goTo(page + delta);
       $("next").addEventListener("click", next);
       $("prev").addEventListener("click", prev);
+      $("first").addEventListener("click", first);
+      $("last").addEventListener("click", last);
+      $("next5").addEventListener("click", () => jump(5));
+      $("prev5").addEventListener("click", () => jump(-5));
 
       // Reset the timer to 00:00 (stopped); it restarts on the next
       // page turn, so a reset right before starting keeps a clean 00:00.
@@ -733,6 +758,13 @@
         )
           return;
         if (!notesPdf) return;
+        // Ctrl/⌘ + arrow: jump 5 slides — checked BEFORE the plain-key
+        // switch so the arrows don't also trigger next()/prev()
+        if ((ev.ctrlKey || ev.metaKey) && ev.key.startsWith("Arrow")) {
+          ev.preventDefault();
+          jump(ev.key === "ArrowRight" ? 5 : -5);
+          return;
+        }
         switch (ev.key) {
           case " ":
           case "ArrowRight":
@@ -747,22 +779,46 @@
             ev.preventDefault();
             prev();
             break;
+          case "Home":
+            ev.preventDefault();
+            first();
+            break;
+          case "End":
+            ev.preventDefault();
+            last();
+            break;
         }
       });
 
+      // Render token: a newer showPage() invalidates an older one in
+      // flight.  Without this, a slow render of page A can complete
+      // AFTER page B's render and swap its canvas back in — the console
+      // preview would jump forward then backward while the audience
+      // (already on B via its own goto) stays put: exactly the
+      // "console lacks behind and jumps" symptom.
+      let renderToken = 0;
       async function showPage(n) {
+        const token = ++renderToken;
         $("pageinfo").textContent = total ? `${n} / ${total}` : `${n}`;
         commitTextEditor(); // finish typing before the stage is rebuilt
         if (!notesPdf) return;
+        const stale = () => token !== renderToken;
         try {
           await Promise.all([
-            renderHalf(notesPdf, n, "right", $("noteswrap")), // notes half
-            renderHalf(notesPdf, n, "left", $("slidewrap")), // current slide
+            renderHalf(notesPdf, n, "right", $("noteswrap"), {
+              cancelled: stale,
+            }), // notes half
+            renderHalf(notesPdf, n, "left", $("slidewrap"), {
+              cancelled: stale,
+            }), // current slide
           ]);
+          if (stale()) return; // superseded — a newer showPage is on it
           // Next-slide preview: render only if it fits the layout (skip on
           // the last page).
           if (n < total) {
-            renderHalf(notesPdf, n + 1, "left", $("nextwrap"));
+            renderHalf(notesPdf, n + 1, "left", $("nextwrap"), {
+              cancelled: stale,
+            });
           } else {
             $("nextwrap").replaceChildren();
           }
@@ -773,8 +829,10 @@
           redrawInk();
           pushStrokes(n);
         } catch (e) {
-          console.error(e);
-          setStatus("render error: " + e.message);
+          if (!stale()) {
+            console.error(e);
+            setStatus("render error: " + e.message);
+          }
         }
       }
 
